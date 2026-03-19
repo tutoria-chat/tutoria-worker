@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Text, Integer, ForeignKey, CheckConstraint, DateTime
+from sqlalchemy import Column, String, Text, Integer, ForeignKey, CheckConstraint, DateTime, Boolean
 from sqlalchemy.orm import relationship
 from .base import BaseModel
 
@@ -20,6 +20,7 @@ class Module(BaseModel):
     tutor_language = Column("TutorLanguage", String(10), default="pt-br", nullable=False)  # Language for AI tutor responses
     ai_model_id = Column("AIModelId", Integer, ForeignKey("AIModels.Id"), nullable=True)
     course_type = Column("CourseType", String(50), nullable=True)
+    is_active = Column("IsActive", Boolean, default=True, nullable=False)
 
     __table_args__ = (
         CheckConstraint("Semester BETWEEN 1 AND 8", name="CK_Modules_Semester"),

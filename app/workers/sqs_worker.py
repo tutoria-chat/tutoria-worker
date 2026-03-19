@@ -84,11 +84,11 @@ async def _process_quiz_gen_message(body: dict) -> None:
         module = (
             db.query(Module)
             .options(joinedload(Module.files))
-            .filter(Module.id == module_id)
+            .filter(Module.id == module_id, Module.is_active == True)
             .first()
         )
         if not module:
-            raise ValueError(f"Module {module_id} not found")
+            raise ValueError(f"Module {module_id} not found or has been deleted")
 
         service = QuizGeneratorService(module, db)
         quizzes = await service.generate_quiz_bank(count=count)

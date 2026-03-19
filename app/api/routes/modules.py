@@ -81,7 +81,7 @@ async def generate_quiz_bank(
     try:
         module = db.query(ModuleModel).options(
             joinedload(ModuleModel.files)
-        ).filter(ModuleModel.id == module_id).first()
+        ).filter(ModuleModel.id == module_id, ModuleModel.is_active == True).first()
         if not module:
             raise HTTPException(status_code=404, detail="Module not found")
 
@@ -153,10 +153,10 @@ def _generate_quizzes_background(
     try:
         module = db.query(ModuleModel).options(
             joinedload(ModuleModel.files)
-        ).filter(ModuleModel.id == module_id).first()
+        ).filter(ModuleModel.id == module_id, ModuleModel.is_active == True).first()
 
         if not module:
-            logger.error(f"Module {module_id} not found in background quiz task")
+            logger.error(f"Module {module_id} not found (or soft-deleted) in background quiz task")
             return
 
         # Delete existing AI-generated quizzes if upserting (never touch question bank / uploaded quizzes)
@@ -227,8 +227,8 @@ async def extract_module_files_text(
     logger = logging.getLogger(__name__)
 
     try:
-        # Get module
-        module = db.query(ModuleModel).filter(ModuleModel.id == module_id).first()
+        # Get module (skip soft-deleted)
+        module = db.query(ModuleModel).filter(ModuleModel.id == module_id, ModuleModel.is_active == True).first()
         if not module:
             raise HTTPException(status_code=404, detail="Module not found")
 
@@ -421,8 +421,8 @@ async def upload_quiz_file(
     logger = logging.getLogger(__name__)
 
     try:
-        # Validate module
-        module = db.query(ModuleModel).filter(ModuleModel.id == module_id).first()
+        # Validate module (skip soft-deleted)
+        module = db.query(ModuleModel).filter(ModuleModel.id == module_id, ModuleModel.is_active == True).first()
         if not module:
             raise HTTPException(status_code=404, detail="Module not found")
 
@@ -488,7 +488,7 @@ async def confirm_extracted_quizzes(
     logger = logging.getLogger(__name__)
 
     try:
-        module = db.query(ModuleModel).filter(ModuleModel.id == module_id).first()
+        module = db.query(ModuleModel).filter(ModuleModel.id == module_id, ModuleModel.is_active == True).first()
         if not module:
             raise HTTPException(status_code=404, detail="Module not found")
 
@@ -547,7 +547,7 @@ async def list_module_quizzes(
     """
     from app.models import Quiz
 
-    module = db.query(ModuleModel).filter(ModuleModel.id == module_id).first()
+    module = db.query(ModuleModel).filter(ModuleModel.id == module_id, ModuleModel.is_active == True).first()
     if not module:
         raise HTTPException(status_code=404, detail="Module not found")
 
@@ -580,7 +580,7 @@ async def delete_quiz_question(
     """
     from app.models import Quiz
 
-    module = db.query(ModuleModel).filter(ModuleModel.id == module_id).first()
+    module = db.query(ModuleModel).filter(ModuleModel.id == module_id, ModuleModel.is_active == True).first()
     if not module:
         raise HTTPException(status_code=404, detail="Module not found")
 
