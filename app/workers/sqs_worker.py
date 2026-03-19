@@ -105,13 +105,19 @@ async def _poll_queue(queue_url: str, queue_name: str, handler) -> None:
     Long-poll a single SQS queue forever.
     Deletes the message only after the handler succeeds.
     On handler error the message becomes visible again after the visibility timeout.
+
+    NOTE: boto3 is synchronous. All network calls are dispatched via asyncio.to_thread()
+    so they never block the event loop — keeping the /health endpoint responsive at all times.
     """
     sqs = _get_sqs_client()
     logger.info("🔁 SQS worker started — queue: %s", queue_name)
 
     while True:
         try:
-            response = sqs.receive_message(
+            # Run the blocking long-poll (WaitTimeSeconds=20) in a thread so the event
+            # loop (and uvicorn's HTTP server, including /health) stays unblocked.
+            response = await asyncio.to_thread(
+                sqs.receive_message,
                 QueueUrl=queue_url,
                 MaxNumberOfMessages=1,        # one at a time — memory safety
                 WaitTimeSeconds=20,           # long-polling, reduces empty-receive cost
@@ -132,8 +138,8 @@ async def _poll_queue(queue_url: str, queue_name: str, handler) -> None:
 
                 await handler(body)
 
-                # Delete only after success
-                sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)
+                # Delete only after success (also non-blocking)
+                await asyncio.to_thread(sqs.delete_message, QueueUrl=queue_url, ReceiptHandle=receipt)
                 logger.info("🗑️  Deleted %s message after success", queue_name)
 
             except Exception as exc:
