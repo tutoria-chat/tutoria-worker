@@ -37,6 +37,8 @@ def _get_sqs_client():
 
 async def _process_extraction_message(body: dict) -> None:
     """Extract text from a single file and persist it to the DB."""
+    from app.models.file import File
+
     file_id: Optional[int] = body.get("file_id")
     module_id: Optional[int] = body.get("module_id")
 
@@ -45,8 +47,12 @@ async def _process_extraction_message(body: dict) -> None:
 
     db = SessionLocal()
     try:
+        file = db.query(File).filter(File.id == file_id).first()
+        if not file:
+            raise ValueError(f"File {file_id} not found in database")
+
         service = DocumentExtractionService(db)
-        await service.extract_and_store(file_id)
+        await service.extract_and_store(file)
         logger.info("✅ Extraction complete — file_id=%s module_id=%s", file_id, module_id)
     finally:
         db.close()
