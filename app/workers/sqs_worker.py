@@ -86,7 +86,7 @@ async def _process_quiz_gen_message(body: dict) -> None:
                 return
 
         from sqlalchemy.orm import joinedload
-        from app.models import Module
+        from app.models import Module, File as FileModel
         module = (
             db.query(Module)
             .options(joinedload(Module.files))
@@ -96,12 +96,33 @@ async def _process_quiz_gen_message(body: dict) -> None:
         if not module:
             raise ValueError(f"Module {module_id} not found or has been deleted")
 
+        # If any files are still being extracted, defer — re-raise so SQS redelivers
+        # after the visibility timeout instead of silently deleting the message.
+        in_progress = [
+            f for f in (module.files or [])
+            if f.is_active and f.processing_status in ("pending", "processing")
+        ]
+        if in_progress:
+            names = [f.name for f in in_progress]
+            raise RuntimeError(
+                f"Quiz gen deferred for module_id={module_id} — "
+                f"{len(in_progress)} file(s) still extracting: {names}"
+            )
+
         service = QuizGeneratorService(module, db)
-        quizzes = await service.generate_quiz_bank(count=count)
-        logger.info(
-            "✅ Quiz gen complete — module_id=%s generated=%s upsert=%s",
-            module_id, len(quizzes), upsert,
-        )
+        try:
+            quizzes = await service.generate_quiz_bank(count=count)
+            logger.info(
+                "✅ Quiz gen complete — module_id=%s generated=%s upsert=%s",
+                module_id, len(quizzes), upsert,
+            )
+        except ValueError as exc:
+            # Permanent data errors (no files, no extractable content after extraction
+            # finished). Retrying will never fix this — delete the message.
+            logger.error(
+                "⛔ Quiz gen aborted for module_id=%s (permanent error, message will be deleted): %s",
+                module_id, exc,
+            )
     finally:
         db.close()
 

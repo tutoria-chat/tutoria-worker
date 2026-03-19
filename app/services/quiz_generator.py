@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models import Module, Quiz, QuizDifficulty
 from app.models.ai_model import AIModel
-from app.services.document_context_service import get_document_context_service
+from app.services.document_context_service import DocumentContextService
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +76,11 @@ class QuizGeneratorService:
 
         # Extract course materials from files (PDFs, YouTube transcripts, etc.)
         # This will extract on-demand if not pre-extracted
-        doc_context_service = get_document_context_service(self.module, self.db)
+        # Create a fresh DocumentContextService — do NOT use the module-level cache.
+        # The SQS worker re-queries a fresh module object on each attempt, so the
+        # cached instance (with stale file objects from an earlier attempt) would
+        # wrongly return empty context even after extraction has completed.
+        doc_context_service = DocumentContextService(self.module, self.db)
         context_result = await doc_context_service.build_context_for_prompt(max_chars=50000)
         self._course_materials = context_result.get("context", "")
         files_used = context_result.get("files_used", [])
