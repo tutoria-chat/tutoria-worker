@@ -39,8 +39,7 @@ class Settings(BaseSettings):
     FILE_PROCESSING_PROVIDER: str = "gemini"
     FILE_PROCESSING_FALLBACK_CHAIN: str = "openai"
 
-    # DB-managed API Keys (encrypted in ProviderKey table)
-    USE_DB_PROVIDER_KEYS: bool = True
+    # Encryption key for DB-managed provider keys (must match tutoria-api)
     ENCRYPTION_KEY: Optional[str] = None
 
     # Retry & Reliability
@@ -64,6 +63,10 @@ class Settings(BaseSettings):
     PDF_MAX_CHUNKS: int = 20
     PDF_MAX_CONTEXT_CHARS: int = 50000
     DOCUMENT_SUMMARY_THRESHOLD: int = 25000
+
+    # SQS Queues (set to empty string to disable; worker skips unconfigured queues)
+    SQS_EXTRACTION_QUEUE_URL: str = ""   # e.g. https://sqs.us-east-2.amazonaws.com/123/tutoria-extraction-dev
+    SQS_QUIZ_GEN_QUEUE_URL: str = ""     # e.g. https://sqs.us-east-2.amazonaws.com/123/tutoria-quiz-gen-dev
 
     # Application
     debug: bool = False

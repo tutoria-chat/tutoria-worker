@@ -1,0 +1,53 @@
+name: Deploy PROD (Railway)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: 'Type "DEPLOY TO PRODUCTION" to confirm'
+        required: true
+        type: string
+
+jobs:
+  validate-confirmation:
+    name: Validate Confirmation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirmation }}" != "DEPLOY TO PRODUCTION" ]; then
+            echo "Confirmation text does not match. Aborting deployment."
+            exit 1
+          fi
+          echo "Confirmation validated. Proceeding with production deployment."
+
+  deploy-railway-prod:
+    name: Deploy to Railway PROD
+    runs-on: ubuntu-latest
+    needs: validate-confirmation
+    environment:
+      name: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+
+      - name: Deploy to Railway
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_PROD }}
+        run: |
+          railway up --service tutoria-worker --environment production
+
+      - name: Deployment Summary
+        run: |
+          echo "## Railway PRODUCTION Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "**URL**: ${{ secrets.RAILWAY_PROD_URL }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Health Check
+        run: |
+          sleep 30
+          curl -f "${{ secrets.RAILWAY_PROD_URL }}/health" || exit 1

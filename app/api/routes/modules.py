@@ -1,9 +1,7 @@
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File as FastAPIFile, Header, status
 from sqlalchemy.orm import Session
-from datetime import datetime, timedelta
 from pydantic import BaseModel
 from typing import List, Optional
-from openai import OpenAI
 import logging
 
 from app.core.database import get_db, SessionLocal
@@ -47,115 +45,6 @@ def require_professor_or_internal_key():
 
 
 router = APIRouter(prefix="/api/v2/modules", tags=["modules"])
-
-
-class ImprovePromptRequest(BaseModel):
-    current_prompt: str
-
-
-class ImprovePromptResponse(BaseModel):
-    improved_prompt: str
-    remaining_improvements: int
-
-
-@router.post("/{module_id}/improve-prompt", response_model=ImprovePromptResponse)
-async def improve_system_prompt(
-    module_id: int,
-    request: ImprovePromptRequest,
-    db: Session = Depends(get_db),
-    current_user=Depends(get_current_professor_or_super_admin),
-):
-    """
-    Improve system prompt using OpenAI API.
-    Limited to 3 improvements per 72 hours per module.
-    """
-    # Get module
-    db_module = (
-        db.query(ModuleModel)
-        .join(CourseModel)
-        .filter(ModuleModel.id == module_id)
-        .first()
-    )
-    if not db_module:
-        raise HTTPException(status_code=404, detail="Módulo não encontrado")
-
-    # Check access
-    if current_user["type"] == "professor":
-        if (
-            not current_user["is_admin"]
-            and db_module.course.university_id != current_user["user"].university_id
-        ):
-            raise HTTPException(status_code=403, detail="Acesso negado")
-
-    # Check rate limit (3 improvements per 72 hours)
-    now = datetime.utcnow()
-    time_window_start = now - timedelta(hours=72)
-
-    # Reset counter if outside 72h window
-    if (
-        not db_module.last_prompt_improved_at
-        or db_module.last_prompt_improved_at < time_window_start
-    ):
-        db_module.prompt_improvement_count = 0
-        db_module.last_prompt_improved_at = now
-
-    # Check if limit reached
-    if db_module.prompt_improvement_count >= 3:
-        # Calculate when they can improve again
-        next_available = db_module.last_prompt_improved_at + timedelta(hours=72)
-        hours_remaining = int((next_available - now).total_seconds() / 3600)
-        raise HTTPException(
-            status_code=429,
-            detail=f"Limite de melhorias atingido. Você pode melhorar novamente em {hours_remaining} horas."
-        )
-
-    # Call OpenAI to improve the prompt
-    try:
-        client = OpenAI(api_key=settings.OPENAI_API_KEY)
-
-        system_message = """Você é um especialista em design de prompts para tutores de IA educacionais.
-Sua tarefa é melhorar prompts de sistema para tutores de IA que ajudam estudantes.
-
-Ao melhorar um prompt:
-1. Mantenha o objetivo educacional original
-2. Torne as instruções mais claras e específicas
-3. Adicione orientações sobre tom e estilo de ensino
-4. Inclua diretrizes para diferentes tipos de perguntas
-5. Mantenha o prompt em português brasileiro
-6. Faça o prompt ser mais estruturado e fácil de seguir
-7. Adicione exemplos quando apropriado
-
-IMPORTANTE: Retorne APENAS o prompt melhorado, sem comentários adicionais."""
-
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": f"Melhore este prompt de tutor IA:\n\n{request.current_prompt}"}
-            ],
-            temperature=0.7,
-            max_tokens=1000
-        )
-
-        improved_prompt = response.choices[0].message.content.strip()
-
-        # Update counters
-        db_module.prompt_improvement_count += 1
-        db_module.last_prompt_improved_at = now
-        db.commit()
-
-        remaining = 3 - db_module.prompt_improvement_count
-
-        return ImprovePromptResponse(
-            improved_prompt=improved_prompt,
-            remaining_improvements=remaining
-        )
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Erro ao melhorar prompt: {str(e)}"
-        )
 
 
 class GenerateQuizResponse(BaseModel):

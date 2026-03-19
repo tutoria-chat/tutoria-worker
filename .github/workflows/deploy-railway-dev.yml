@@ -1,0 +1,37 @@
+name: Deploy DEV (Railway)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy-railway:
+    name: Deploy to Railway DEV
+    runs-on: ubuntu-latest
+    environment:
+      name: dev
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+
+      - name: Deploy to Railway
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_DEV }}
+        run: |
+          railway up --service tutoria-worker --environment development
+
+      - name: Deployment Summary
+        run: |
+          echo "## Railway DEV Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "**URL**: ${{ secrets.RAILWAY_DEV_URL }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Health Check
+        run: |
+          sleep 30
+          curl -f "${{ secrets.RAILWAY_DEV_URL }}/health" || exit 1

@@ -9,6 +9,7 @@ from app.core.config import settings
 from app.core.swagger_config import custom_openapi
 from app.workers.document_extraction_worker import run_extraction_worker
 from app.workers.quiz_maintenance_worker import run_daily_maintenance
+from app.workers.sqs_worker import run_sqs_workers
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,10 @@ async def lifespan(app: FastAPI):
     tasks = []
 
     logger.info("🚀 Starting tutoria-worker background jobs...")
+
+    # SQS consumers — react to on-upload extraction and quiz-gen triggers from .NET API
+    tasks.append(asyncio.create_task(run_sqs_workers(), name="sqs-workers"))
+    logger.info("  ✅ SQS workers started (extraction + quiz-gen queues)")
 
     # Daily 2 AM sweep: extract text from any files that missed on-upload extraction
     tasks.append(asyncio.create_task(run_extraction_worker(), name="extraction-worker"))
