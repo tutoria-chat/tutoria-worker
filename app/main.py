@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes import modules
 from app.core.config import settings
 from app.core.swagger_config import custom_openapi
-from app.workers.document_extraction_worker import run_extraction_worker
+from app.workers.document_extraction_worker import run_extraction_worker, run_failed_extraction_retry_worker
 from app.workers.quiz_maintenance_worker import run_daily_maintenance
 from app.workers.sqs_worker import run_sqs_workers
 
@@ -25,7 +25,11 @@ async def lifespan(app: FastAPI):
     tasks.append(asyncio.create_task(run_sqs_workers(), name="sqs-workers"))
     logger.info("  ✅ SQS workers started (extraction + quiz-gen queues)")
 
-    # Daily 2 AM sweep: extract text from any files that missed on-upload extraction
+    # Every 4h: retry files with processing_status='failed'
+    tasks.append(asyncio.create_task(run_failed_extraction_retry_worker(), name="failed-extraction-retry"))
+    logger.info("  ✅ Failed-extraction retry worker started (every 4h)")
+
+    # Daily 2 AM sweep: extract text from any files that were never processed
     tasks.append(asyncio.create_task(run_extraction_worker(), name="extraction-worker"))
     logger.info("  ✅ Document extraction worker scheduled (daily @ 2 AM)")
 

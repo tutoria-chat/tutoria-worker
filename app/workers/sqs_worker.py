@@ -53,19 +53,49 @@ async def _process_extraction_message(body: dict) -> None:
 
 
 async def _process_quiz_gen_message(body: dict) -> None:
-    """Generate (or regenerate) quizzes for a module."""
+    """Generate quizzes for a module — skip if already generated and upsert=False."""
+    from app.models import Quiz
+
     module_id: Optional[int] = body.get("module_id")
     count: int = body.get("count", 50)
-    upsert: bool = body.get("upsert", True)
+    upsert: bool = body.get("upsert", False)
 
     if not module_id:
         raise ValueError(f"Missing module_id in quiz-gen message: {body}")
 
     db = SessionLocal()
     try:
-        service = QuizGeneratorService(db)
-        await service.generate_for_module(module_id, count=count, upsert=upsert)
-        logger.info("✅ Quiz gen complete — module_id=%s count=%s upsert=%s", module_id, count, upsert)
+        # Skip generation if quizzes already exist and upsert was not requested
+        if not upsert:
+            existing = (
+                db.query(Quiz)
+                .filter(Quiz.module_id == module_id, Quiz.source == "ai_generated")
+                .count()
+            )
+            if existing > 0:
+                logger.info(
+                    "⏭️  Quiz gen skipped — module_id=%s already has %s ai_generated quizzes",
+                    module_id, existing,
+                )
+                return
+
+        from sqlalchemy.orm import joinedload
+        from app.models import Module
+        module = (
+            db.query(Module)
+            .options(joinedload(Module.files))
+            .filter(Module.id == module_id)
+            .first()
+        )
+        if not module:
+            raise ValueError(f"Module {module_id} not found")
+
+        service = QuizGeneratorService(module, db)
+        quizzes = await service.generate_quiz_bank(count=count)
+        logger.info(
+            "✅ Quiz gen complete — module_id=%s generated=%s upsert=%s",
+            module_id, len(quizzes), upsert,
+        )
     finally:
         db.close()
 
