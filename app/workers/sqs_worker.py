@@ -127,6 +127,34 @@ async def _process_quiz_gen_message(body: dict) -> None:
         db.close()
 
 
+async def _process_transcription_message(body: dict) -> None:
+    """Transcribe a YouTube video for an existing pending File record."""
+    from app.models.file import File
+    from app.services.transcription_service import TranscriptionService
+
+    file_id: Optional[int] = body.get("file_id")
+    youtube_url: Optional[str] = body.get("youtube_url")
+    language: str = body.get("language", "pt-br")
+
+    if not file_id or not youtube_url:
+        raise ValueError(f"Missing file_id or youtube_url in transcription message: {body}")
+
+    db = SessionLocal()
+    try:
+        file = db.query(File).filter(File.id == file_id).first()
+        if not file:
+            raise ValueError(f"File {file_id} not found in database")
+
+        service = TranscriptionService(db)
+        result = service.transcribe_existing_file(file_id=file_id, youtube_url=youtube_url, language=language)
+        logger.info(
+            "✅ Transcription complete — file_id=%s words=%s source=%s",
+            file_id, result.get("word_count"), result.get("source"),
+        )
+    finally:
+        db.close()
+
+
 async def _poll_queue(queue_url: str, queue_name: str, handler) -> None:
     """
     Long-poll a single SQS queue forever.
@@ -191,11 +219,12 @@ async def _poll_queue(queue_url: str, queue_name: str, handler) -> None:
 
 async def run_sqs_workers() -> None:
     """
-    Start both SQS consumer loops concurrently.
+    Start all SQS consumer loops concurrently.
     Skips any queue whose URL is not configured (e.g. local dev without SQS).
     """
     extraction_url = settings.SQS_EXTRACTION_QUEUE_URL
     quiz_gen_url = settings.SQS_QUIZ_GEN_QUEUE_URL
+    transcription_url = settings.SQS_TRANSCRIPTION_QUEUE_URL
 
     tasks = []
 
@@ -216,6 +245,15 @@ async def run_sqs_workers() -> None:
         logger.info("  ✅ SQS quiz-gen worker started")
     else:
         logger.warning("  ⚠️  SQS_QUIZ_GEN_QUEUE_URL not set — quiz-gen SQS worker disabled")
+
+    if transcription_url:
+        tasks.append(asyncio.create_task(
+            _poll_queue(transcription_url, "transcription", _process_transcription_message),
+            name="sqs-transcription",
+        ))
+        logger.info("  ✅ SQS transcription worker started")
+    else:
+        logger.warning("  ⚠️  SQS_TRANSCRIPTION_QUEUE_URL not set — transcription SQS worker disabled")
 
     if tasks:
         await asyncio.gather(*tasks)

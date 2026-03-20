@@ -65,8 +65,9 @@ class Settings(BaseSettings):
     DOCUMENT_SUMMARY_THRESHOLD: int = 25000
 
     # SQS Queues (set to empty string to disable; worker skips unconfigured queues)
-    SQS_EXTRACTION_QUEUE_URL: str = ""   # e.g. https://sqs.us-east-2.amazonaws.com/123/tutoria-extraction-dev
-    SQS_QUIZ_GEN_QUEUE_URL: str = ""     # e.g. https://sqs.us-east-2.amazonaws.com/123/tutoria-quiz-gen-dev
+    SQS_EXTRACTION_QUEUE_URL: str = ""       # e.g. https://sqs.us-east-2.amazonaws.com/123/tutoria-extraction-dev
+    SQS_QUIZ_GEN_QUEUE_URL: str = ""         # e.g. https://sqs.us-east-2.amazonaws.com/123/tutoria-quiz-gen-dev
+    SQS_TRANSCRIPTION_QUEUE_URL: str = ""    # e.g. https://sqs.us-east-2.amazonaws.com/123/tutoria-transcription-dev
 
     # Application
     debug: bool = False
