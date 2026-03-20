@@ -53,6 +53,13 @@ except ImportError:
         PYPDF2_AVAILABLE = False
         logger.warning("pypdf/PyPDF2 not available - fallback PDF extraction disabled")
 
+try:
+    from pptx import Presentation as PptxPresentation
+    PPTX_AVAILABLE = True
+except ImportError:
+    PPTX_AVAILABLE = False
+    logger.warning("python-pptx not available - PPTX extraction will use AI fallback")
+
 
 class DocumentExtractionService:
     """Service for extracting text from documents and storing in database."""
@@ -108,10 +115,11 @@ class DocumentExtractionService:
                     return False
 
                 is_pdf = self._is_pdf(file)
+                is_pptx = self._is_pptx(file)
                 extracted_text = None
 
-                # Step 1: Try local extraction for PDFs (fast & free).
-                # Run in a thread so CPU-bound PDF parsing never blocks the event loop.
+                # Step 1: Try local extraction for PDFs and PPTX (fast & free).
+                # Run in a thread so CPU-bound parsing never blocks the event loop.
                 if is_pdf:
                     loop = asyncio.get_event_loop()
                     extracted_text = await loop.run_in_executor(
@@ -121,6 +129,16 @@ class DocumentExtractionService:
                         word_count = len(extracted_text.split())
                         if word_count < 20:
                             logger.warning(f"Local extraction too sparse ({word_count} words), falling back to AI")
+                            extracted_text = None
+                elif is_pptx:
+                    loop = asyncio.get_event_loop()
+                    extracted_text = await loop.run_in_executor(
+                        None, self._extract_pptx, file_bytes, file
+                    )
+                    if extracted_text:
+                        word_count = len(extracted_text.split())
+                        if word_count < 10:
+                            logger.warning(f"PPTX extraction too sparse ({word_count} words), falling back to AI")
                             extracted_text = None
 
                 # Step 2: AI extraction if local failed or non-PDF
@@ -425,10 +443,47 @@ Document:
             or (file.file_name and file.file_name.lower().endswith('.pdf'))
         )
 
+    def _is_pptx(self, file: File) -> bool:
+        """Check if a file is a PowerPoint presentation."""
+        pptx_types = (
+            'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+            'application/vnd.ms-powerpoint',
+        )
+        return (
+            (file.content_type and file.content_type.lower() in pptx_types)
+            or (file.file_type and file.file_type.lower() in pptx_types)
+            or (file.file_name and file.file_name.lower().endswith(('.pptx', '.ppt')))
+        )
+
+    def _extract_pptx(self, pptx_bytes: bytes, file: File) -> Optional[str]:
+        """Extract text from a PowerPoint file using python-pptx."""
+        if not PPTX_AVAILABLE:
+            return None
+        try:
+            prs = PptxPresentation(io.BytesIO(pptx_bytes))
+            parts = []
+            for i, slide in enumerate(prs.slides, 1):
+                slide_texts = []
+                for shape in slide.shapes:
+                    if shape.has_text_frame:
+                        for para in shape.text_frame.paragraphs:
+                            text = para.text.strip()
+                            if text:
+                                slide_texts.append(text)
+                if slide_texts:
+                    parts.append(f"[Slide {i}]\n" + "\n".join(slide_texts))
+            if parts:
+                result = "\n\n".join(parts)
+                logger.info(f"Extracted {len(prs.slides)} slides from PPTX file {file.id}: {len(result)} chars")
+                return result
+        except Exception as e:
+            logger.warning(f"python-pptx extraction failed for file {file.id}: {e}")
+        return None
+
     def _get_raw_content(self, file_bytes: bytes, file: File) -> Optional[str]:
         """
         Get raw text content from file bytes.
-        Uses local extraction for PDFs, direct decode for text files.
+        Uses local extraction for PDFs/PPTX, direct decode for text files.
         """
         # Try text decode for text-based files
         if file.content_type and 'text' in file.content_type.lower():
@@ -443,6 +498,12 @@ Document:
             if text:
                 return text
 
+        # Try PPTX extraction
+        if self._is_pptx(file):
+            text = self._extract_pptx(file_bytes, file)
+            if text:
+                return text
+
         # Last resort: try raw decode (handles .txt, .csv, .md, etc.)
         try:
             decoded = file_bytes.decode('utf-8', errors='ignore')
@@ -451,8 +512,8 @@ Document:
         except Exception:
             pass
 
-        # Binary files - return hex preview for AI to identify
-        logger.warning(f"File {file.id} appears to be binary, AI extraction may not work")
+        # Binary files — cannot extract raw content; AI extraction won't help either
+        logger.warning(f"File {file.id} ({file.file_name}) is binary with no supported extractor")
         return None
 
     async def _download_file(self, file: File) -> Optional[bytes]:

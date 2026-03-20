@@ -99,6 +99,16 @@ class QuizGeneratorService:
             logger.error(error_msg)
             raise ValueError(error_msg)
 
+        # Delete any existing ai_generated quizzes before regenerating
+        deleted = (
+            self.db.query(Quiz)
+            .filter(Quiz.module_id == self.module.id, Quiz.source == "ai_generated")
+            .delete(synchronize_session=False)
+        )
+        self.db.commit()
+        if deleted:
+            logger.info(f"🗑️  Deleted {deleted} existing ai_generated quizzes for module {self.module.id} before regenerating")
+
         # Calculate difficulty distribution
         easy_count = int(count * 0.4)  # 40%
         medium_count = int(count * 0.4)  # 40%
@@ -418,6 +428,7 @@ REQUISITOS CRÍTICOS:
    - Por que as respostas ERRADAS estão erradas (erros conceituais comuns)
 3. Perguntas claras e objetivas
 4. Nível {difficulty.value}: {"conceitos básicos" if difficulty == QuizDifficulty.EASY else "aplicação prática" if difficulty == QuizDifficulty.MEDIUM else "análise crítica e síntese"}
+5. NÃO mencione nomes de arquivos, documentos ou slides nas perguntas — foque no conteúdo
 
 Responda com JSON no formato:
 {{"questions": [
@@ -447,6 +458,7 @@ CRITICAL REQUIREMENTS:
    - Why the WRONG answers are wrong (common conceptual errors)
 3. Clear and objective questions
 4. {difficulty.value} level: {"basic concepts" if difficulty == QuizDifficulty.EASY else "practical application" if difficulty == QuizDifficulty.MEDIUM else "critical analysis and synthesis"}
+5. Do NOT mention file names, document names, or slide numbers in questions — focus on content only
 
 Respond with JSON in the format:
 {{"questions": [
@@ -476,6 +488,7 @@ REQUISITOS CRÍTICOS:
    - Por qué las respuestas INCORRECTAS son incorrectas (errores conceptuales comunes)
 3. Preguntas claras y objetivas
 4. Nivel {difficulty.value}: {"conceptos básicos" if difficulty == QuizDifficulty.EASY else "aplicación práctica" if difficulty == QuizDifficulty.MEDIUM else "análisis crítico y síntesis"}
+5. NO menciones nombres de archivos, documentos o diapositivas en las preguntas — enfócate en el contenido
 
 Responde con JSON en el formato:
 {{"questions": [
