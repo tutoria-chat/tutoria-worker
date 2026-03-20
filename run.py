@@ -39,6 +39,12 @@ def run_prod():
     if hasattr(signal, 'SIGTERM'):
         signal.signal(signal.SIGTERM, signal_handler)
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
+
     port = int(os.environ.get("PORT", 8001))
 
     # Worker is CPU/memory heavy — keep concurrency low (1-2 workers max).
