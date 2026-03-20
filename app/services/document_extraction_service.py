@@ -31,8 +31,13 @@ SUMMARIZE_THRESHOLD = 80000  # ~20k tokens
 
 # Limit concurrent extractions to avoid OOM.
 # pdfplumber can use 10-50× the raw file size in working memory; allowing too
-# many simultaneous extractions blows through Railway/Azure container limits.
-_EXTRACTION_SEMAPHORE = asyncio.Semaphore(2)
+# many simultaneous extractions blows through Railway/ECS container limits.
+# Keep at 1 — a single 8 MB PDF can spike to 400 MB with pdfplumber.
+_EXTRACTION_SEMAPHORE = asyncio.Semaphore(1)
+
+# Above this size, skip pdfplumber (full layout + images in RAM) and go straight
+# to pypdf (streaming, ~2-3× raw file size).  3 MB is a safe threshold.
+_PDFPLUMBER_MAX_BYTES = 3 * 1024 * 1024  # 3 MB
 
 # Try to import PDF libraries (optional dependencies)
 try:
@@ -117,21 +122,37 @@ class DocumentExtractionService:
                 is_pdf = self._is_pdf(file)
                 is_pptx = self._is_pptx(file)
                 extracted_text = None
+                loop = asyncio.get_event_loop()
 
-                # Step 1: Try local extraction for PDFs and PPTX (fast & free).
-                # Run in a thread so CPU-bound parsing never blocks the event loop.
                 if is_pdf:
-                    loop = asyncio.get_event_loop()
-                    extracted_text = await loop.run_in_executor(
-                        None, self._extract_with_python, file_bytes, file
+                    # Step 1a: peek at page resources — fast, no text extraction
+                    has_images = await loop.run_in_executor(
+                        None, self._has_pdf_images, file_bytes
                     )
-                    if extracted_text:
-                        word_count = len(extracted_text.split())
-                        if word_count < 20:
-                            logger.warning(f"Local extraction too sparse ({word_count} words), falling back to AI")
-                            extracted_text = None
+
+                    if has_images:
+                        # PDF has embedded images/diagrams — send raw bytes to Gemini
+                        # so it can read both text and visual content in one pass.
+                        logger.info(f"PDF {file.id} contains images — using Gemini vision extraction")
+                        extracted_text = await self._extract_pdf_with_gemini_vision(file_bytes, file)
+
+                    if not extracted_text:
+                        # Text-only PDF (or Gemini failed) — use local pypdf/pdfplumber
+                        extracted_text = await loop.run_in_executor(
+                            None, self._extract_with_python, file_bytes, file
+                        )
+                        if extracted_text and len(extracted_text.split()) < 20:
+                            # Sparse result → likely a scanned PDF; try Gemini vision
+                            logger.warning(
+                                f"pypdf returned sparse text ({len(extracted_text.split())} words) "
+                                f"for file {file.id} — trying Gemini vision"
+                            )
+                            extracted_text = (
+                                await self._extract_pdf_with_gemini_vision(file_bytes, file)
+                                or extracted_text
+                            )
+
                 elif is_pptx:
-                    loop = asyncio.get_event_loop()
                     extracted_text = await loop.run_in_executor(
                         None, self._extract_pptx, file_bytes, file
                     )
@@ -141,12 +162,13 @@ class DocumentExtractionService:
                             logger.warning(f"PPTX extraction too sparse ({word_count} words), falling back to AI")
                             extracted_text = None
 
-                # Step 2: AI extraction if local failed or non-PDF
+                # Step 2: AI extraction if local failed or non-PDF/PPTX file type
                 if not extracted_text:
                     extracted_text = await self._extract_with_ai(file_bytes, file)
 
                 # Free the raw bytes — no longer needed, can be large
                 del file_bytes
+                import gc; gc.collect()
 
                 if not extracted_text:
                     logger.warning(f"No text extracted from file {file.id}")
@@ -572,13 +594,142 @@ Document:
         logger.error(f"File {file.id} has no blob_path or blob_url")
         return None
 
+    def _has_pdf_images(self, pdf_bytes: bytes) -> bool:
+        """
+        Peek at PDF page resources to detect embedded images (XObjects of subtype Image).
+        Uses pypdf's lazy page parser — does NOT extract text, so it's very fast and lean.
+        Returns True if any page contains at least one image.
+        Falls back to True on error so we don't silently skip Gemini vision.
+        """
+        if not PYPDF2_AVAILABLE:
+            return True  # can't check — assume images so Gemini is used
+        try:
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+            for page in reader.pages:
+                if page.images:
+                    return True
+            return False
+        except Exception as e:
+            logger.warning(f"Could not scan PDF for images: {e} — assuming images present")
+            return True
+
+    async def _extract_pdf_with_gemini_vision(self, pdf_bytes: bytes, file: File) -> Optional[str]:
+        """
+        Send the raw PDF bytes to Gemini via the native REST API so it can extract
+        both text AND visual content (images, diagrams, charts, scanned pages).
+
+        Uses inline_data (base64) which supports PDFs up to 20 MB.
+        Falls back gracefully if no API key or the file is too large.
+        """
+        import base64
+        import httpx
+
+        # 20 MB inline_data limit from Gemini
+        max_size = 20 * 1024 * 1024
+        if len(pdf_bytes) > max_size:
+            logger.warning(
+                f"PDF {file.id} is {len(pdf_bytes) // (1024*1024)} MB — "
+                f"exceeds Gemini inline limit ({max_size // (1024*1024)} MB), skipping vision"
+            )
+            return None
+
+        # Resolve Gemini API key (DB-managed key first, then env)
+        api_key = None
+        if self.db:
+            try:
+                from app.services.key_manager import KeyManager
+                km = KeyManager(self.db)
+                result = km.get_next_key("gemini")
+                if result:
+                    _, api_key = result
+            except Exception:
+                pass
+        if not api_key:
+            api_key = settings.GEMINI_API_KEY
+        if not api_key:
+            logger.warning("No Gemini API key available — skipping PDF vision extraction")
+            return None
+
+        file_name = file.file_name or file.name or "document.pdf"
+        file_size_mb = len(pdf_bytes) / (1024 * 1024)
+
+        payload = {
+            "contents": [{
+                "parts": [
+                    {
+                        "inline_data": {
+                            "mime_type": "application/pdf",
+                            "data": base64.b64encode(pdf_bytes).decode(),
+                        }
+                    },
+                    {
+                        "text": (
+                            f'Extract all content from this PDF document named "{file_name}".\n\n'
+                            "Instructions:\n"
+                            "- Extract ALL text, including text inside images, diagrams, and charts\n"
+                            "- Preserve document structure (headings, paragraphs, lists)\n"
+                            "- Format tables as markdown tables\n"
+                            "- For diagrams or figures, describe the key information they convey\n"
+                            "- Output only the extracted content — no commentary or preamble"
+                        )
+                    },
+                ]
+            }],
+            "generationConfig": {
+                "maxOutputTokens": 8192,
+                "temperature": 0.1,
+            },
+        }
+
+        # Respect DB-configured extraction model, fall back to gemini-flash-lite-latest
+        model = "gemini-flash-lite-latest"
+        chain = self._get_provider_chain()
+        for entry in chain:
+            if entry.get("provider") == "gemini" and entry.get("model"):
+                model = entry["model"]
+                break
+
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta"
+            f"/models/{model}:generateContent?key={api_key}"
+        )
+
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                response = await client.post(url, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                text = data["candidates"][0]["content"]["parts"][0]["text"]
+
+            if text and len(text) > 50:
+                logger.info(
+                    f"Gemini vision extracted {len(text)} chars from PDF {file.id} "
+                    f"({file_size_mb:.1f} MB)"
+                )
+                return text
+
+            logger.warning(f"Gemini vision returned insufficient content for file {file.id}")
+            return None
+
+        except Exception as e:
+            logger.warning(f"Gemini vision extraction failed for file {file.id}: {type(e).__name__}: {str(e)[:200]}")
+            return None
+
     def _extract_with_python(self, pdf_bytes: bytes, file: File) -> Optional[str]:
         """
-        Extract text using Python libraries (pdfplumber or PyPDF2).
+        Extract text using Python libraries (pdfplumber or pypdf).
         Fast, free, but may struggle with complex layouts.
+
+        pdfplumber loads full page layout (including embedded images/fonts) and
+        can use 10-50× the raw file size.  For files above _PDFPLUMBER_MAX_BYTES
+        we skip it entirely and use pypdf, which streams pages and stays much leaner.
         """
-        # Try pdfplumber first (best quality)
-        if PDFPLUMBER_AVAILABLE:
+        import gc
+
+        file_size = len(pdf_bytes)
+        use_pdfplumber = PDFPLUMBER_AVAILABLE and file_size <= _PDFPLUMBER_MAX_BYTES
+
+        if use_pdfplumber:
             try:
                 with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                     text_parts = []
@@ -588,12 +739,20 @@ Document:
                             text_parts.append(page_text)
 
                     if text_parts:
-                        logger.info(f"Extracted text from {len(text_parts)} pages using pdfplumber")
-                        return "\n\n".join(text_parts)
+                        result = "\n\n".join(text_parts)
+                        logger.info(f"Extracted text from {len(text_parts)} pages using pdfplumber ({file_size // 1024} KB)")
+                        return result
             except Exception as e:
-                logger.warning(f"pdfplumber extraction failed: {e}, trying PyPDF2...")
+                logger.warning(f"pdfplumber extraction failed: {e}, trying pypdf...")
+            finally:
+                gc.collect()
+        elif PDFPLUMBER_AVAILABLE:
+            logger.info(
+                f"File {file.id} is {file_size // 1024} KB — skipping pdfplumber "
+                f"(limit {_PDFPLUMBER_MAX_BYTES // 1024} KB), using pypdf instead"
+            )
 
-        # Fallback to PyPDF2
+        # pypdf: preferred for large PDFs — pages are parsed lazily, ~2-3× raw size in RAM
         if PYPDF2_AVAILABLE:
             try:
                 reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -604,10 +763,12 @@ Document:
                         text_parts.append(page_text)
 
                 if text_parts:
-                    logger.info(f"Extracted text from {len(text_parts)} pages using PyPDF2")
+                    logger.info(f"Extracted text from {len(text_parts)} pages using pypdf ({file_size // 1024} KB)")
                     return "\n\n".join(text_parts)
             except Exception as e:
-                logger.error(f"PyPDF2 extraction failed: {e}")
+                logger.error(f"pypdf extraction failed: {e}")
+            finally:
+                gc.collect()
 
         return None
 
