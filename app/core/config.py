@@ -69,6 +69,16 @@ class Settings(BaseSettings):
     SQS_QUIZ_GEN_QUEUE_URL: str = ""         # e.g. https://sqs.us-east-2.amazonaws.com/123/tutoria-quiz-gen-dev
     SQS_TRANSCRIPTION_QUEUE_URL: str = ""    # e.g. https://sqs.us-east-2.amazonaws.com/123/tutoria-transcription-dev
 
+    # DynamoDB (analytics)
+    AWS_DYNAMODB_CHAT_TABLE: str = "ChatMessages"
+    AWS_DYNAMODB_QUIZ_ATTEMPTS_TABLE: str = "QuizAttempts"
+
+    # Analytics Workers
+    ANALYTICS_WORKERS_ENABLED: bool = True
+    TOPIC_CLASSIFICATION_PROVIDER: str = "openai"
+    TOPIC_CLASSIFICATION_FALLBACK_CHAIN: str = "gemini,deepseek"
+    TTL_BACKFILL_ENABLED: bool = False
+
     # Application
     debug: bool = False
 

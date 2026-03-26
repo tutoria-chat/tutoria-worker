@@ -10,6 +10,10 @@ from app.core.swagger_config import custom_openapi
 from app.workers.document_extraction_worker import run_extraction_worker, run_failed_extraction_retry_worker
 from app.workers.quiz_maintenance_worker import run_daily_maintenance
 from app.workers.sqs_worker import run_sqs_workers
+from app.workers.analytics_aggregation_worker import run_analytics_aggregation_worker
+from app.workers.topic_classification_worker import run_topic_classification_worker
+from app.workers.quiz_analytics_worker import run_quiz_analytics_worker
+from app.workers.ttl_backfill_worker import run_ttl_backfill
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +40,24 @@ async def lifespan(app: FastAPI):
     # Daily 2 AM sweep: regenerate quizzes for modules whose files changed
     tasks.append(asyncio.create_task(run_daily_maintenance(), name="quiz-maintenance-worker"))
     logger.info("  ✅ Quiz maintenance worker scheduled (daily @ 2 AM)")
+
+    # Analytics workers (pre-compute dashboard data nightly)
+    if settings.ANALYTICS_WORKERS_ENABLED:
+        tasks.append(asyncio.create_task(run_analytics_aggregation_worker(), name="analytics-aggregation"))
+        logger.info("  ✅ Analytics aggregation worker scheduled (daily @ 2:30 AM)")
+
+        tasks.append(asyncio.create_task(run_topic_classification_worker(), name="topic-classification"))
+        logger.info("  ✅ Topic classification worker scheduled (daily @ 3:00 AM)")
+
+        tasks.append(asyncio.create_task(run_quiz_analytics_worker(), name="quiz-analytics"))
+        logger.info("  ✅ Quiz analytics worker scheduled (daily @ 3:30 AM)")
+    else:
+        logger.info("  ⚠️  Analytics workers disabled (ANALYTICS_WORKERS_ENABLED=false)")
+
+    # One-time TTL backfill (enable once, run, disable)
+    if settings.TTL_BACKFILL_ENABLED:
+        tasks.append(asyncio.create_task(run_ttl_backfill(), name="ttl-backfill"))
+        logger.info("  ✅ TTL backfill job started (one-time)")
 
     yield  # App runs here
 

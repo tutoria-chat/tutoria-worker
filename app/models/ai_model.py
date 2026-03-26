@@ -20,6 +20,7 @@ class AIModel(BaseModel):
     deprecation_date = Column("DeprecationDate", DateTime(timezone=True), nullable=True)
     use_for_file_extraction = Column("UseForFileExtraction", Boolean, default=False, nullable=False)
     use_for_formatting = Column("UseForFormatting", Boolean, default=False, nullable=True)
+    use_for_topic_classification = Column("UseForTopicClassification", Boolean, default=False, nullable=False)
     description = Column("Description", String(500), nullable=True)
     recommended_for = Column("RecommendedFor", String(200), nullable=True)
 
