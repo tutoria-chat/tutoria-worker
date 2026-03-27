@@ -42,17 +42,14 @@ async def lifespan(app: FastAPI):
     logger.info("  ✅ Quiz maintenance worker scheduled (daily @ 2 AM)")
 
     # Analytics workers (pre-compute dashboard data nightly)
-    if settings.ANALYTICS_WORKERS_ENABLED:
-        tasks.append(asyncio.create_task(run_analytics_aggregation_worker(), name="analytics-aggregation"))
-        logger.info("  ✅ Analytics aggregation worker scheduled (daily @ 2:30 AM)")
+    tasks.append(asyncio.create_task(run_analytics_aggregation_worker(), name="analytics-aggregation"))
+    logger.info("  ✅ Analytics aggregation worker scheduled (daily @ 2:30 AM)")
 
-        tasks.append(asyncio.create_task(run_topic_classification_worker(), name="topic-classification"))
-        logger.info("  ✅ Topic classification worker scheduled (daily @ 3:00 AM)")
+    tasks.append(asyncio.create_task(run_topic_classification_worker(), name="topic-classification"))
+    logger.info("  ✅ Topic classification worker scheduled (daily @ 3:00 AM)")
 
-        tasks.append(asyncio.create_task(run_quiz_analytics_worker(), name="quiz-analytics"))
-        logger.info("  ✅ Quiz analytics worker scheduled (daily @ 3:30 AM)")
-    else:
-        logger.info("  ⚠️  Analytics workers disabled (ANALYTICS_WORKERS_ENABLED=false)")
+    tasks.append(asyncio.create_task(run_quiz_analytics_worker(), name="quiz-analytics"))
+    logger.info("  ✅ Quiz analytics worker scheduled (daily @ 3:30 AM)")
 
     # One-time TTL backfill (enable once, run, disable)
     if settings.TTL_BACKFILL_ENABLED:

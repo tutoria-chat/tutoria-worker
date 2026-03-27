@@ -74,7 +74,6 @@ class Settings(BaseSettings):
     AWS_DYNAMODB_QUIZ_ATTEMPTS_TABLE: str = "QuizAttempts"
 
     # Analytics Workers
-    ANALYTICS_WORKERS_ENABLED: bool = True
     TOPIC_CLASSIFICATION_PROVIDER: str = "openai"
     TOPIC_CLASSIFICATION_FALLBACK_CHAIN: str = "gemini,deepseek"
     TTL_BACKFILL_ENABLED: bool = False
