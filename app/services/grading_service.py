@@ -1,0 +1,540 @@
+"""
+Grading Service - AI-powered batch grading of student written answers.
+
+Input  : JSON file uploaded to S3 (Moodle-compatible format)
+Output : CSV  → S3  (matricula,email,cmid,slot,nota,comentario)
+
+Flow:
+  1. Load GradingJob from DB, set status → processing
+  2. Download input JSON from S3
+  3. Parse JSON with field normalizer (handles snake/camel/Pascal)
+  4. Load course context: all modules → all active files → extracted text
+  5. For each student: batch-grade all non-empty answers in ONE AI call
+     - Empty answers → nota=0, comentario="Resposta não fornecida" (no AI call)
+  6. Build CSV and upload to S3
+  7. Update DB: status=completed or failed
+"""
+
+import asyncio
+import csv
+import io
+import json
+import logging
+import re
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+from typing import Any, Optional
+
+import boto3
+from botocore.exceptions import ClientError
+from sqlalchemy.orm import Session, joinedload
+
+from app.core.config import settings
+from app.models import Module, File
+from app.models.ai_model import AIModel
+from app.models.grading_job import GradingJob
+
+logger = logging.getLogger(__name__)
+
+# Maximum course context characters sent to the AI (prevents context window overflow)
+MAX_CONTEXT_CHARS = 25_000
+
+
+# ---------------------------------------------------------------------------
+# Key normalizer
+# ---------------------------------------------------------------------------
+
+def _to_snake(key: str) -> str:
+    """Convert camelCase / PascalCase / _prefixed to snake_case."""
+    key = key.lstrip("_")          # strip Moodle's internal _ prefix
+    key = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", key)
+    key = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key)
+    return key.lower()
+
+
+def _normalize(obj: Any) -> Any:
+    """Recursively normalize dict keys to snake_case."""
+    if isinstance(obj, dict):
+        return {_to_snake(k): _normalize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_normalize(i) for i in obj]
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# Course context builder
+# ---------------------------------------------------------------------------
+
+async def _build_course_context(course_id: int, db: Session) -> str:
+    """
+    Load extracted text from all active files across all active modules of
+    the course. Prefers summarized_text for large files to stay under token limits.
+    """
+    modules = (
+        db.query(Module)
+        .options(joinedload(Module.files))
+        .filter(Module.course_id == course_id, Module.is_active == True)
+        .all()
+    )
+
+    parts: list[str] = []
+    total_chars = 0
+
+    for module in modules:
+        active_files: list[File] = [f for f in (module.files or []) if f.is_active]
+        for file in active_files:
+            if total_chars >= MAX_CONTEXT_CHARS:
+                break
+
+            # Pick best available text
+            text = file.summarized_text if (
+                file.summarized_text and
+                file.extracted_text and
+                len(file.extracted_text) > 25_000
+            ) else file.extracted_text
+
+            if not text and file.transcript_text:
+                text = file.transcript_text
+
+            if not text:
+                continue
+
+            remaining = MAX_CONTEXT_CHARS - total_chars
+            snippet = text[:remaining]
+            parts.append(f"=== {file.name} ===\n{snippet}\n")
+            total_chars += len(snippet)
+
+        if total_chars >= MAX_CONTEXT_CHARS:
+            break
+
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# AI provider chain (mirrors quiz_extractor.py pattern)
+# ---------------------------------------------------------------------------
+
+def _get_provider_chain(db: Session) -> list[dict]:
+    """DB-configured UseForFileExtraction models first, then config fallback."""
+    try:
+        db_models = (
+            db.query(AIModel)
+            .filter(
+                AIModel.use_for_file_extraction == True,
+                AIModel.is_active == True,
+                AIModel.is_deprecated == False,
+            )
+            .all()
+        )
+        if db_models:
+            chain = [{"provider": m.provider.lower(), "model": m.model_name} for m in db_models]
+            logger.info("Grading using DB-configured models: %s", [c["model"] for c in chain])
+            return chain
+    except Exception as exc:
+        logger.warning("Failed to query DB for extraction models: %s", exc)
+
+    primary = settings.FILE_PROCESSING_PROVIDER.lower()
+    fallback_str = getattr(settings, "FILE_PROCESSING_FALLBACK_CHAIN", "openai")
+    fallbacks = [p.strip().lower() for p in fallback_str.split(",") if p.strip()]
+    chain = [{"provider": p, "model": None} for p in [primary] + fallbacks]
+    logger.info("Grading using config-based chain: %s", [c["provider"] for c in chain])
+    return chain
+
+
+async def _call_provider(
+    provider: str,
+    model_name: Optional[str],
+    system_prompt: str,
+    user_prompt: str,
+    db: Session,
+) -> Optional[str]:
+    """Call a single AI provider and return raw text response."""
+    from types import SimpleNamespace
+
+    dummy = SimpleNamespace(id=0, ai_model=None, ai_model_id=None, name="grading")
+
+    if provider == "anthropic":
+        try:
+            from app.services.anthropic_service import AnthropicService
+        except ImportError:
+            logger.error("anthropic package not installed; skipping")
+            return None
+        svc = AnthropicService(module=dummy, model_name=model_name, db=db)
+        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+        result = await svc.answer_question_with_history(messages)
+        return result.get("response", "")
+
+    if provider == "openai":
+        from app.services.ai_service import AIService
+        svc = AIService(module=dummy, db=db)
+        if model_name:
+            svc.model_name = model_name
+        client = svc.async_client
+    elif provider == "deepseek":
+        from app.services.deepseek_service import DeepSeekService
+        svc = DeepSeekService(module=dummy, model_name=model_name, db=db)
+        client = svc.client
+    elif provider == "gemini":
+        from app.services.gemini_service import GeminiService
+        svc = GeminiService(module=dummy, model_name=model_name, db=db)
+        client = svc.client
+    elif provider == "xai":
+        from app.services.xai_service import XAIService
+        svc = XAIService(module=dummy, model_name=model_name, db=db)
+        client = svc.client
+    else:
+        logger.warning("Unsupported grading provider: %s", provider)
+        return None
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    response = await client.chat.completions.create(
+        model=svc.model_name,
+        messages=messages,
+        max_tokens=8192,
+        temperature=0.1,
+    )
+    return response.choices[0].message.content
+
+
+async def _call_ai(system_prompt: str, user_prompt: str, db: Session) -> str:
+    """Try each provider in the chain; raise if all fail."""
+    chain = _get_provider_chain(db)
+    last_error = None
+    for entry in chain:
+        try:
+            result = await _call_provider(entry["provider"], entry.get("model"), system_prompt, user_prompt, db)
+            if result:
+                return result
+        except Exception as exc:
+            last_error = exc
+            logger.warning("Grading: provider %s failed: %s", entry["provider"], exc)
+    raise RuntimeError(f"Grading: all AI providers failed. Last error: {last_error}")
+
+
+# ---------------------------------------------------------------------------
+# Parse AI grading response
+# ---------------------------------------------------------------------------
+
+def _parse_grading_response(text: str, questions: list[dict]) -> list[dict]:
+    """
+    Parse the AI JSON response into [{slot, grade, comment}].
+    Handles code fences and partial responses.
+    Falls back to 0/error-comment for any question the AI didn't cover.
+    """
+    cleaned = text.strip()
+    code_block = re.search(r"```(?:json)?\s*\n?(.*?)```", cleaned, re.DOTALL)
+    if code_block:
+        cleaned = code_block.group(1).strip()
+
+    parsed: list[dict] = []
+    try:
+        data = json.loads(cleaned)
+        if isinstance(data, list):
+            parsed = data
+        elif isinstance(data, dict) and "grades" in data:
+            parsed = data["grades"]
+        elif isinstance(data, dict) and "results" in data:
+            parsed = data["results"]
+    except json.JSONDecodeError:
+        # Try to extract JSON array from partial response
+        start = cleaned.find("[")
+        end = cleaned.rfind("]") + 1
+        if start >= 0 and end > start:
+            try:
+                parsed = json.loads(cleaned[start:end])
+            except json.JSONDecodeError:
+                pass
+
+    # Index by slot for O(1) lookup
+    by_slot: dict[int, dict] = {}
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        slot = item.get("slot")
+        if slot is not None:
+            by_slot[int(slot)] = item
+
+    results: list[dict] = []
+    for q in questions:
+        slot = int(q["slot"])
+        max_mark = _parse_decimal(q.get("max_mark", "1") or "1")
+        if slot in by_slot:
+            raw_grade = _parse_decimal(str(by_slot[slot].get("grade", 0)))
+            # Clamp to [0, max_mark]
+            grade = max(Decimal("0"), min(raw_grade, max_mark))
+            comment = str(by_slot[slot].get("comment", "")).strip() or "—"
+        else:
+            grade = Decimal("0")
+            comment = "Não avaliado"
+        results.append({"slot": slot, "grade": grade, "comment": comment})
+
+    return results
+
+
+def _parse_decimal(value: str) -> Decimal:
+    try:
+        return Decimal(str(value).replace(",", "."))
+    except InvalidOperation:
+        return Decimal("0")
+
+
+# ---------------------------------------------------------------------------
+# S3 helpers
+# ---------------------------------------------------------------------------
+
+def _get_s3():
+    return boto3.client(
+        "s3",
+        region_name=settings.AWS_REGION,
+        aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+    )
+
+
+async def _download_s3_json(s3_key: str) -> list:
+    s3 = _get_s3()
+    response = await asyncio.to_thread(
+        s3.get_object, Bucket=settings.S3_BUCKET_NAME, Key=s3_key
+    )
+    raw = response["Body"].read()
+    data = json.loads(raw.decode("utf-8"))
+    if not isinstance(data, list):
+        raise ValueError("Input JSON must be an array of student submissions")
+    return _normalize(data)
+
+
+async def _upload_s3_csv(s3_key: str, csv_bytes: bytes) -> None:
+    s3 = _get_s3()
+    await asyncio.to_thread(
+        s3.put_object,
+        Bucket=settings.S3_BUCKET_NAME,
+        Key=s3_key,
+        Body=csv_bytes,
+        ContentType="text/csv",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main grading logic
+# ---------------------------------------------------------------------------
+
+class GradingService:
+    def __init__(self, db: Session):
+        self.db = db
+
+    async def process_job(self, job_id: int, course_id: int) -> None:
+        """
+        Full processing cycle for one grading job.
+        Updates DB status throughout. Catches all errors to ensure DB is always updated.
+        """
+        job: Optional[GradingJob] = self.db.query(GradingJob).filter(GradingJob.id == job_id).first()
+        if not job:
+            logger.error("GradingJob %s not found in DB", job_id)
+            return
+
+        logger.info("🎓 Starting grading job %s for course %s", job_id, course_id)
+
+        # Mark processing
+        job.status = "processing"
+        job.updated_at = datetime.now(timezone.utc)
+        self.db.commit()
+
+        try:
+            await self._run(job, course_id)
+        except Exception as exc:
+            logger.error("❌ Grading job %s failed: %s", job_id, exc, exc_info=True)
+            job.status = "failed"
+            job.error_message = str(exc)[:2000]
+            job.processed_at = datetime.now(timezone.utc)
+            job.updated_at = datetime.now(timezone.utc)
+            self.db.commit()
+
+    async def _run(self, job: GradingJob, course_id: int) -> None:
+        # 1. Download + parse input JSON
+        if not job.input_s3_key:
+            raise ValueError("GradingJob has no input_s3_key")
+
+        logger.info("Downloading input JSON: %s", job.input_s3_key)
+        submissions = await _download_s3_json(job.input_s3_key)
+        logger.info("Parsed %d student submission(s)", len(submissions))
+
+        job.total_submissions = len(submissions)
+        self.db.commit()
+
+        # 2. Build course context (all modules, all files)
+        logger.info("Building course context for course %s…", course_id)
+        course_context = await _build_course_context(course_id, self.db)
+        logger.info("Course context: %d chars", len(course_context))
+
+        # 3. Grade each student
+        csv_rows: list[dict] = []
+        processed = 0
+
+        for submission in submissions:
+            try:
+                rows = await self._grade_submission(submission, course_context)
+                csv_rows.extend(rows)
+                processed += 1
+                job.processed_submissions = processed
+                self.db.commit()
+            except Exception as exc:
+                logger.error(
+                    "Failed to grade submission for student %s: %s",
+                    submission.get("id") or submission.get("matricula", "?"),
+                    exc,
+                    exc_info=True,
+                )
+                # Add zero-graded rows with error comment so the CSV is still complete
+                matricula = str(submission.get("id") or submission.get("matricula", ""))
+                email = str(submission.get("email", ""))
+                cmid = str(submission.get("quiz_cmid", ""))
+                for q in submission.get("questions", []):
+                    csv_rows.append({
+                        "matricula": matricula,
+                        "email": email,
+                        "cmid": cmid,
+                        "slot": str(q.get("slot", "")),
+                        "nota": "0",
+                        "comentario": f"Erro ao processar: {str(exc)[:200]}",
+                    })
+                processed += 1
+                job.processed_submissions = processed
+                self.db.commit()
+
+        # 4. Build and upload CSV
+        result_key = f"grading-jobs/{course_id}/{job.id}/result.csv"
+        csv_bytes = _build_csv(csv_rows)
+        logger.info("Uploading result CSV (%d bytes) to %s", len(csv_bytes), result_key)
+        await _upload_s3_csv(result_key, csv_bytes)
+
+        # 5. Mark completed
+        job.status = "completed"
+        job.result_s3_key = result_key
+        job.processed_at = datetime.now(timezone.utc)
+        job.updated_at = datetime.now(timezone.utc)
+        self.db.commit()
+
+        logger.info(
+            "✅ Grading job %s completed — %d submissions, %d CSV rows",
+            job.id, processed, len(csv_rows),
+        )
+
+    async def _grade_submission(self, submission: dict, course_context: str) -> list[dict]:
+        """
+        Grade all questions for one student. Returns list of CSV-row dicts.
+        Empty answers get 0 without an AI call.
+        All non-empty answers are batched into a single AI call per student.
+        """
+        matricula = str(submission.get("id") or submission.get("matricula", ""))
+        email = str(submission.get("email", ""))
+        cmid = str(submission.get("quiz_cmid", ""))
+        questions: list[dict] = submission.get("questions", [])
+
+        rows: list[dict] = []
+        ai_questions: list[dict] = []
+
+        for q in questions:
+            slot = str(q.get("slot", ""))
+            answer = str(q.get("answer") or "").strip()
+            max_mark = str(q.get("max_mark", "1") or "1")
+
+            if not answer:
+                # Empty answer — no AI needed
+                rows.append({
+                    "matricula": matricula,
+                    "email": email,
+                    "cmid": cmid,
+                    "slot": slot,
+                    "nota": "0",
+                    "comentario": "Resposta não fornecida",
+                })
+            else:
+                ai_questions.append({
+                    "slot": q.get("slot"),
+                    "question_text": str(q.get("question_text") or "").strip(),
+                    "answer": answer,
+                    "max_mark": max_mark,
+                })
+
+        if not ai_questions:
+            return rows
+
+        # Single AI call for all non-empty answers of this student
+        graded = await self._call_ai_for_student(ai_questions, course_context)
+
+        for result in graded:
+            rows.append({
+                "matricula": matricula,
+                "email": email,
+                "cmid": cmid,
+                "slot": str(result["slot"]),
+                "nota": str(result["grade"]),
+                "comentario": result["comment"],
+            })
+
+        return rows
+
+    async def _call_ai_for_student(
+        self, questions: list[dict], course_context: str
+    ) -> list[dict]:
+        """
+        One AI call that grades all questions for a single student.
+        Returns [{slot, grade, comment}] — one entry per question.
+        """
+        questions_json = json.dumps(
+            [
+                {
+                    "slot": q["slot"],
+                    "question": q["question_text"],
+                    "answer": q["answer"],
+                    "max_mark": q["max_mark"],
+                }
+                for q in questions
+            ],
+            ensure_ascii=False,
+            indent=2,
+        )
+
+        context_section = (
+            f"Course content:\n{course_context}\n\n" if course_context.strip() else ""
+        )
+
+        system_prompt = (
+            "You are an academic grader. Evaluate each student answer based on the "
+            "course content provided and the question. "
+            "Assign a decimal grade between 0 and max_mark. "
+            "Write brief, constructive feedback in the SAME LANGUAGE as the question. "
+            "Return ONLY valid JSON — no markdown, no explanation outside JSON."
+        )
+
+        user_prompt = (
+            f"{context_section}"
+            f"Grade the following student answers:\n{questions_json}\n\n"
+            "Return a JSON array:\n"
+            '[{"slot": <number>, "grade": <decimal 0..max_mark>, "comment": "<feedback>"}]\n'
+            "One entry per question. No other text."
+        )
+
+        response_text = await _call_ai(system_prompt, user_prompt, self.db)
+        return _parse_grading_response(response_text, questions)
+
+
+# ---------------------------------------------------------------------------
+# CSV builder
+# ---------------------------------------------------------------------------
+
+def _build_csv(rows: list[dict]) -> bytes:
+    """Serialize rows to UTF-8 CSV bytes with header: matricula,email,cmid,slot,nota,comentario"""
+    output = io.StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=["matricula", "email", "cmid", "slot", "nota", "comentario"],
+        extrasaction="ignore",
+        lineterminator="\n",
+    )
+    writer.writeheader()
+    writer.writerows(rows)
+    return output.getvalue().encode("utf-8")

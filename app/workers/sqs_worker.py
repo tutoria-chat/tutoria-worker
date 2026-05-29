@@ -155,6 +155,26 @@ async def _process_transcription_message(body: dict) -> None:
         db.close()
 
 
+async def _process_grading_message(body: dict) -> None:
+    """Grade a batch of student answers and upload a CSV result to S3."""
+    job_id: Optional[int] = body.get("job_id")
+    course_id: Optional[int] = body.get("course_id")
+
+    if not job_id:
+        raise ValueError(f"Missing job_id in grading message: {body}")
+    if not course_id:
+        raise ValueError(f"Missing course_id in grading message: {body}")
+
+    db = SessionLocal()
+    try:
+        from app.services.grading_service import GradingService
+        service = GradingService(db)
+        await service.process_job(job_id, course_id)
+        logger.info("✅ Grading complete — job_id=%s course_id=%s", job_id, course_id)
+    finally:
+        db.close()
+
+
 async def _poll_queue(queue_url: str, queue_name: str, handler) -> None:
     """
     Long-poll a single SQS queue forever.
@@ -225,6 +245,7 @@ async def run_sqs_workers() -> None:
     extraction_url = settings.SQS_EXTRACTION_QUEUE_URL
     quiz_gen_url = settings.SQS_QUIZ_GEN_QUEUE_URL
     transcription_url = settings.SQS_TRANSCRIPTION_QUEUE_URL
+    grading_url = settings.SQS_GRADING_QUEUE_URL
 
     tasks = []
 
@@ -254,6 +275,15 @@ async def run_sqs_workers() -> None:
         logger.info("  ✅ SQS transcription worker started")
     else:
         logger.warning("  ⚠️  SQS_TRANSCRIPTION_QUEUE_URL not set — transcription SQS worker disabled")
+
+    if grading_url:
+        tasks.append(asyncio.create_task(
+            _poll_queue(grading_url, "grading", _process_grading_message),
+            name="sqs-grading",
+        ))
+        logger.info("  ✅ SQS grading worker started")
+    else:
+        logger.warning("  ⚠️  SQS_GRADING_QUEUE_URL not set — grading SQS worker disabled")
 
     if tasks:
         await asyncio.gather(*tasks)
