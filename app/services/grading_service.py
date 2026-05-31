@@ -281,6 +281,30 @@ def _parse_decimal(value: str) -> Decimal:
         return Decimal("0")
 
 
+def _format_nota(grade) -> str:
+    """
+    Convert a Decimal/float grade to a clean decimal string with period separator.
+    Strips unnecessary trailing zeros: 1.50 → "1.5", 2.00 → "2", 0.75 → "0.75".
+    """
+    try:
+        d = Decimal(str(grade)).normalize()
+        # normalize() removes trailing zeros; convert back to fixed-point if needed
+        formatted = format(d, "f")
+        return formatted
+    except Exception:
+        return "0"
+
+
+def _sanitize_comment(text: str) -> str:
+    """
+    Strip newlines and excessive whitespace from AI-generated comments.
+    Newlines inside a CSV field would break row parsing in most tools.
+    """
+    if not text:
+        return "—"
+    return " ".join(text.split())
+
+
 # ---------------------------------------------------------------------------
 # S3 helpers
 # ---------------------------------------------------------------------------
@@ -388,17 +412,21 @@ class GradingService:
                     exc_info=True,
                 )
                 # Add zero-graded rows with error comment so the CSV is still complete
-                matricula = str(submission.get("id") or submission.get("matricula", ""))
+                matricula = str(
+                    submission.get("id") or submission.get("matricula")
+                    or submission.get("userid") or submission.get("idnumber") or ""
+                )
                 email = str(submission.get("email", ""))
-                cmid = str(submission.get("quiz_cmid", ""))
+                sub_cmid = str(submission.get("quiz_cmid") or submission.get("cmid") or "")
                 for q in submission.get("questions", []):
+                    q_cmid = sub_cmid or str(q.get("quiz_cmid") or q.get("cmid") or "")
                     csv_rows.append({
                         "matricula": matricula,
                         "email": email,
-                        "cmid": cmid,
+                        "cmid": q_cmid,
                         "slot": str(q.get("slot", "")),
                         "nota": "0",
-                        "comentario": f"Erro ao processar: {str(exc)[:200]}",
+                        "comentario": _sanitize_comment(f"Erro ao processar: {str(exc)[:200]}"),
                     })
                 processed += 1
                 job.processed_submissions = processed
@@ -428,9 +456,18 @@ class GradingService:
         Empty answers get 0 without an AI call.
         All non-empty answers are batched into a single AI call per student.
         """
-        matricula = str(submission.get("id") or submission.get("matricula", ""))
+        # Accept several common field names for student identifier
+        matricula = str(
+            submission.get("id")
+            or submission.get("matricula")
+            or submission.get("userid")
+            or submission.get("idnumber")
+            or submission.get("student_id")
+            or ""
+        )
         email = str(submission.get("email", ""))
-        cmid = str(submission.get("quiz_cmid", ""))
+        # Submission-level cmid (falls back to question-level per question)
+        submission_cmid = str(submission.get("quiz_cmid") or submission.get("cmid") or "")
         questions: list[dict] = submission.get("questions", [])
 
         rows: list[dict] = []
@@ -440,6 +477,8 @@ class GradingService:
             slot = str(q.get("slot", ""))
             answer = str(q.get("answer") or "").strip()
             max_mark = str(q.get("max_mark", "1") or "1")
+            # Prefer question-level cmid when submission-level is absent
+            cmid = submission_cmid or str(q.get("quiz_cmid") or q.get("cmid") or "")
 
             if not answer:
                 # Empty answer — no AI needed
@@ -457,6 +496,7 @@ class GradingService:
                     "question_text": str(q.get("question_text") or "").strip(),
                     "answer": answer,
                     "max_mark": max_mark,
+                    "cmid": cmid,  # carry per-question cmid through
                 })
 
         if not ai_questions:
@@ -466,13 +506,18 @@ class GradingService:
         graded = await self._call_ai_for_student(ai_questions, course_context)
 
         for result in graded:
+            # Retrieve the cmid that was associated with this slot
+            q_cmid = next(
+                (q["cmid"] for q in ai_questions if str(q["slot"]) == str(result["slot"])),
+                submission_cmid,
+            )
             rows.append({
                 "matricula": matricula,
                 "email": email,
-                "cmid": cmid,
+                "cmid": q_cmid,
                 "slot": str(result["slot"]),
-                "nota": str(result["grade"]),
-                "comentario": result["comment"],
+                "nota": _format_nota(result["grade"]),
+                "comentario": _sanitize_comment(result["comment"]),
             })
 
         return rows
@@ -527,14 +572,23 @@ class GradingService:
 # ---------------------------------------------------------------------------
 
 def _build_csv(rows: list[dict]) -> bytes:
-    """Serialize rows to UTF-8 CSV bytes with header: matricula,email,cmid,slot,nota,comentario"""
+    """
+    Serialize rows to UTF-8-with-BOM CSV bytes.
+    Header: matricula,email,cmid,slot,nota,comentario
+
+    - UTF-8 BOM (﻿) ensures Excel on Windows (Portuguese locale) opens correctly.
+    - QUOTE_ALL ensures every field is quoted, preventing any in-field comma from
+      being misinterpreted as a column separator.
+    """
     output = io.StringIO()
     writer = csv.DictWriter(
         output,
         fieldnames=["matricula", "email", "cmid", "slot", "nota", "comentario"],
         extrasaction="ignore",
-        lineterminator="\n",
+        lineterminator="\r\n",   # Windows-style line endings for Excel compatibility
+        quoting=csv.QUOTE_ALL,
     )
     writer.writeheader()
     writer.writerows(rows)
-    return output.getvalue().encode("utf-8")
+    # Prepend UTF-8 BOM so Excel auto-detects encoding
+    return "﻿".encode("utf-8") + output.getvalue().encode("utf-8")
