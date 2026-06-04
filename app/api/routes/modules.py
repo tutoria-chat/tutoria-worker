@@ -392,6 +392,17 @@ class UploadQuizResponse(BaseModel):
     job_id: Optional[int] = None
 
 
+class QuizUploadJobDto(BaseModel):
+    id: int
+    module_id: int
+    status: str
+    extracted_count: int
+    error_message: Optional[str] = None
+    original_filename: Optional[str] = None
+    processed_at: Optional[str] = None
+    created_at: Optional[str] = None
+
+
 class ConfirmQuizzesRequest(BaseModel):
     questions: List[dict]
     uploaded_file_id: Optional[int] = None
@@ -404,7 +415,7 @@ class ConfirmQuizzesResponse(BaseModel):
     module_id: int
 
 
-@router.post("/{module_id}/upload-quiz-file", response_model=UploadQuizResponse)
+@router.post("/{module_id}/upload-quiz-file", status_code=202)
 async def upload_quiz_file(
     module_id: int,
     file: UploadFile = FastAPIFile(...),
@@ -412,10 +423,12 @@ async def upload_quiz_file(
     current_user=Depends(get_current_professor_or_super_admin),
 ):
     """
-    Upload a file containing quiz questions and extract them using AI.
+    Upload a file containing quiz questions for async AI extraction.
 
-    Accepts: PDF, DOCX, XLSX, CSV, TXT
-    Returns extracted questions for professor review before saving.
+    Accepts: PDF, DOCX, XLSX, CSV, TXT (max 10 MB)
+    Returns 202 Accepted immediately with a job_id.
+    Poll GET /{module_id}/quiz-upload-jobs/{job_id} to check status.
+    When status=completed, GET /{module_id}/quiz-upload-jobs/{job_id}/questions returns the extracted questions.
     """
     import logging
     logger = logging.getLogger(__name__)
@@ -435,40 +448,158 @@ async def upload_quiz_file(
                 detail=f"Unsupported file type: .{file_ext}. Allowed: {', '.join(allowed_extensions)}"
             )
 
-        # Read file content
+        # Read and validate file size
         content = await file.read()
         if len(content) > 10 * 1024 * 1024:  # 10MB limit
             raise HTTPException(status_code=400, detail="File too large. Maximum 10MB.")
 
-        # Extract text from file
-        from app.services.quiz_extractor import extract_text_from_file, QuizExtractorService
-
-        text_content = extract_text_from_file(content, file.filename)
-        if not text_content.strip():
-            raise HTTPException(status_code=400, detail="Could not extract text from file. File may be empty or corrupted.")
-
-        logger.info(f"Extracted {len(text_content)} characters from {file.filename}")
-
-        # Use AI to extract structured questions
-        extractor = QuizExtractorService(module, db)
-        questions = await extractor.extract_from_text(text_content, file.filename)
-
-        return UploadQuizResponse(
-            status="success",
-            message=f"Extracted {len(questions)} questions from {file.filename}. Review and confirm to save.",
-            extracted_count=len(questions),
-            questions=questions,
-            module_id=module_id
+        # Create QuizUploadJob record (pending) first to get the ID
+        from app.models import QuizUploadJob
+        job = QuizUploadJob(
+            module_id=module_id,
+            status="pending",
+            extracted_count=0,
+            original_filename=file.filename,
         )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+
+        # Upload file to S3: quiz-upload-jobs/{module_id}/{job_id}/{filename}
+        from app.services.blob_storage import BlobStorageService
+        import asyncio
+        import boto3
+
+        s3_key = f"quiz-upload-jobs/{module_id}/{job.id}/{file.filename}"
+        try:
+            blob = BlobStorageService()
+            s3 = boto3.client(
+                "s3",
+                region_name=settings.AWS_REGION,
+                aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+                aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+            )
+            await asyncio.to_thread(
+                s3.put_object,
+                Bucket=settings.S3_BUCKET_NAME,
+                Key=s3_key,
+                Body=content,
+                ContentType=file.content_type or "application/octet-stream",
+            )
+        except Exception as upload_err:
+            logger.error(f"Failed to upload quiz file to S3: {upload_err}")
+            job.status = "failed"
+            job.error_message = "Failed to upload file to storage"
+            db.commit()
+            raise HTTPException(status_code=500, detail="Failed to upload file")
+
+        job.input_s3_key = s3_key
+        db.commit()
+
+        # Send SQS message (non-blocking) — worker will extract and store questions
+        quiz_upload_url = settings.SQS_QUIZ_UPLOAD_QUEUE_URL
+        if quiz_upload_url:
+            try:
+                import json as _json
+                sqs = boto3.client(
+                    "sqs",
+                    region_name=settings.AWS_REGION,
+                    aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+                    aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+                )
+                await asyncio.to_thread(
+                    sqs.send_message,
+                    QueueUrl=quiz_upload_url,
+                    MessageBody=_json.dumps({"job_id": job.id, "module_id": module_id}),
+                )
+                logger.info(f"📨 SQS quiz-upload message sent for job {job.id}")
+            except Exception as sqs_err:
+                # Non-fatal: job is created, but SQS message failed
+                logger.warning(f"⚠️ Failed to send SQS message for quiz upload job {job.id}: {sqs_err}")
+        else:
+            logger.warning("SQS_QUIZ_UPLOAD_QUEUE_URL not configured — quiz upload job will not process automatically")
+
+        logger.info(f"Created quiz upload job {job.id} for module {module_id} ({file.filename})")
+
+        return {
+            "status": "pending",
+            "message": f"File uploaded. Processing in background — check job status to review extracted questions.",
+            "job_id": job.id,
+            "module_id": module_id,
+        }
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error extracting quizzes from uploaded file: {type(e).__name__}: {e}")
+        logger.error(f"Error creating quiz upload job: {type(e).__name__}: {e}")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to extract quizzes: {str(e)[:500]}"
+            detail=f"Failed to create quiz upload job: {str(e)[:500]}"
         )
+
+
+@router.get("/{module_id}/quiz-upload-jobs", response_model=List[QuizUploadJobDto])
+async def list_quiz_upload_jobs(
+    module_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_professor_or_super_admin),
+):
+    """List all quiz upload jobs for a module, newest first."""
+    from app.models import QuizUploadJob
+    jobs = (
+        db.query(QuizUploadJob)
+        .filter(QuizUploadJob.module_id == module_id)
+        .order_by(QuizUploadJob.id.desc())
+        .all()
+    )
+    return [
+        QuizUploadJobDto(
+            id=j.id,
+            module_id=j.module_id,
+            status=j.status,
+            extracted_count=j.extracted_count,
+            error_message=j.error_message,
+            original_filename=j.original_filename,
+            processed_at=j.processed_at.isoformat() if j.processed_at else None,
+            created_at=j.created_at.isoformat() if j.created_at else None,
+        )
+        for j in jobs
+    ]
+
+
+@router.get("/{module_id}/quiz-upload-jobs/{job_id}/questions")
+async def get_quiz_upload_job_questions(
+    module_id: int,
+    job_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_professor_or_super_admin),
+):
+    """
+    Return the extracted questions for a completed quiz upload job.
+    Only available when status=completed.
+    """
+    import json as _json
+    from app.models import QuizUploadJob
+    job = db.query(QuizUploadJob).filter(
+        QuizUploadJob.id == job_id,
+        QuizUploadJob.module_id == module_id,
+    ).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Quiz upload job not found")
+    if job.status != "completed":
+        raise HTTPException(status_code=400, detail=f"Job is not completed (status: {job.status})")
+    if not job.extracted_questions_json:
+        raise HTTPException(status_code=400, detail="No extracted questions available for this job")
+
+    questions = _json.loads(job.extracted_questions_json)
+    return {
+        "status": "success",
+        "message": f"Extracted {len(questions)} questions. Review and confirm to save.",
+        "extracted_count": len(questions),
+        "questions": questions,
+        "module_id": module_id,
+        "job_id": job_id,
+    }
 
 
 @router.post("/{module_id}/confirm-extracted-quizzes", response_model=ConfirmQuizzesResponse)

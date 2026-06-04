@@ -69,6 +69,7 @@ class Settings(BaseSettings):
     SQS_QUIZ_GEN_QUEUE_URL: str = ""         # e.g. https://sqs.us-east-2.amazonaws.com/123/tutoria-quiz-gen-dev
     SQS_TRANSCRIPTION_QUEUE_URL: str = ""    # e.g. https://sqs.us-east-2.amazonaws.com/123/tutoria-transcription-dev
     SQS_GRADING_QUEUE_URL: str = ""          # e.g. https://sqs.us-east-2.amazonaws.com/123/tutoria-grading-dev
+    SQS_QUIZ_UPLOAD_QUEUE_URL: str = ""      # e.g. https://sqs.us-east-2.amazonaws.com/123/tutoria-quiz-upload-dev
 
     # DynamoDB (analytics)
     AWS_DYNAMODB_CHAT_TABLE: str = "ChatMessages"

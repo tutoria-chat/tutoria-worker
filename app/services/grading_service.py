@@ -393,13 +393,14 @@ class GradingService:
         course_context = await _build_course_context(course_id, self.db)
         logger.info("Course context: %d chars", len(course_context))
 
-        # 3. Grade each student
+        # 3. Grade each student (pass grading_criteria from job)
+        grading_criteria: Optional[str] = getattr(job, "grading_criteria", None)
         csv_rows: list[dict] = []
         processed = 0
 
         for submission in submissions:
             try:
-                rows = await self._grade_submission(submission, course_context)
+                rows = await self._grade_submission(submission, course_context, grading_criteria)
                 csv_rows.extend(rows)
                 processed += 1
                 job.processed_submissions = processed
@@ -450,7 +451,7 @@ class GradingService:
             job.id, processed, len(csv_rows),
         )
 
-    async def _grade_submission(self, submission: dict, course_context: str) -> list[dict]:
+    async def _grade_submission(self, submission: dict, course_context: str, grading_criteria: Optional[str] = None) -> list[dict]:
         """
         Grade all questions for one student. Returns list of CSV-row dicts.
         Empty answers get 0 without an AI call.
@@ -503,7 +504,7 @@ class GradingService:
             return rows
 
         # Single AI call for all non-empty answers of this student
-        graded = await self._call_ai_for_student(ai_questions, course_context)
+        graded = await self._call_ai_for_student(ai_questions, course_context, grading_criteria)
 
         for result in graded:
             # Retrieve the cmid that was associated with this slot
@@ -523,7 +524,7 @@ class GradingService:
         return rows
 
     async def _call_ai_for_student(
-        self, questions: list[dict], course_context: str
+        self, questions: list[dict], course_context: str, grading_criteria: Optional[str] = None
     ) -> list[dict]:
         """
         One AI call that grades all questions for a single student.
@@ -547,6 +548,12 @@ class GradingService:
             f"Course content:\n{course_context}\n\n" if course_context.strip() else ""
         )
 
+        criteria_section = (
+            f"Grading criteria defined by the professor:\n{grading_criteria.strip()}\n\n"
+            if grading_criteria and grading_criteria.strip()
+            else ""
+        )
+
         system_prompt = (
             "You are an academic grader. Evaluate each student answer based on the "
             "course content provided and the question. "
@@ -557,6 +564,7 @@ class GradingService:
 
         user_prompt = (
             f"{context_section}"
+            f"{criteria_section}"
             f"Grade the following student answers:\n{questions_json}\n\n"
             "Return a JSON array:\n"
             '[{"slot": <number>, "grade": <decimal 0..max_mark>, "comment": "<feedback>"}]\n'

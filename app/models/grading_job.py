@@ -20,6 +20,7 @@ class GradingJob(BaseModel):
     processed_submissions = Column("ProcessedSubmissions", Integer, default=0, nullable=False)
     error_message = Column("ErrorMessage", Text, nullable=True)
     processed_at = Column("ProcessedAt", DateTime(timezone=True), nullable=True)
+    grading_criteria = Column("GradingCriteria", Text, nullable=True)
 
     __table_args__ = (
         CheckConstraint(

@@ -155,6 +155,85 @@ async def _process_transcription_message(body: dict) -> None:
         db.close()
 
 
+async def _process_quiz_upload_message(body: dict) -> None:
+    """Extract quiz questions from an uploaded file and store in QuizUploadJob."""
+    job_id: Optional[int] = body.get("job_id")
+    module_id: Optional[int] = body.get("module_id")
+
+    if not job_id:
+        raise ValueError(f"Missing job_id in quiz-upload message: {body}")
+    if not module_id:
+        raise ValueError(f"Missing module_id in quiz-upload message: {body}")
+
+    db = SessionLocal()
+    try:
+        from app.models import QuizUploadJob, Module as ModuleModel
+        from app.services.quiz_extractor import extract_text_from_file, QuizExtractorService
+        import json as _json
+        import boto3
+        import asyncio
+
+        job = db.query(QuizUploadJob).filter(QuizUploadJob.id == job_id).first()
+        if not job:
+            raise ValueError(f"QuizUploadJob {job_id} not found in database")
+        if not job.input_s3_key:
+            raise ValueError(f"QuizUploadJob {job_id} has no input_s3_key")
+
+        module = db.query(ModuleModel).filter(ModuleModel.id == module_id, ModuleModel.is_active == True).first()
+        if not module:
+            raise ValueError(f"Module {module_id} not found or inactive")
+
+        # Mark processing
+        from datetime import datetime, timezone
+        job.status = "processing"
+        db.commit()
+
+        # Download file from S3
+        from app.core.config import settings as _settings
+        s3 = boto3.client(
+            "s3",
+            region_name=_settings.AWS_REGION,
+            aws_access_key_id=_settings.AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=_settings.AWS_SECRET_ACCESS_KEY,
+        )
+        response = await asyncio.to_thread(
+            s3.get_object, Bucket=_settings.S3_BUCKET_NAME, Key=job.input_s3_key
+        )
+        content = response["Body"].read()
+
+        filename = job.original_filename or job.input_s3_key.rsplit("/", 1)[-1]
+
+        # Extract text + questions
+        text_content = extract_text_from_file(content, filename)
+        if not text_content.strip():
+            raise ValueError("Could not extract text from file. File may be empty or corrupted.")
+
+        extractor = QuizExtractorService(module, db)
+        questions = await extractor.extract_from_text(text_content, filename)
+
+        # Store extracted questions as JSON
+        job.extracted_questions_json = _json.dumps(questions, ensure_ascii=False)
+        job.extracted_count = len(questions)
+        job.status = "completed"
+        job.processed_at = datetime.now(timezone.utc)
+        db.commit()
+
+        logger.info("✅ Quiz upload extraction complete — job_id=%s module_id=%s extracted=%s",
+                    job_id, module_id, len(questions))
+    except Exception as exc:
+        from app.models import QuizUploadJob as _QUJ
+        from datetime import datetime, timezone
+        job_fail = db.query(_QUJ).filter(_QUJ.id == job_id).first()
+        if job_fail:
+            job_fail.status = "failed"
+            job_fail.error_message = str(exc)[:2000]
+            job_fail.processed_at = datetime.now(timezone.utc)
+            db.commit()
+        raise
+    finally:
+        db.close()
+
+
 async def _process_grading_message(body: dict) -> None:
     """Grade a batch of student answers and upload a CSV result to S3."""
     job_id: Optional[int] = body.get("job_id")
@@ -246,6 +325,7 @@ async def run_sqs_workers() -> None:
     quiz_gen_url = settings.SQS_QUIZ_GEN_QUEUE_URL
     transcription_url = settings.SQS_TRANSCRIPTION_QUEUE_URL
     grading_url = settings.SQS_GRADING_QUEUE_URL
+    quiz_upload_url = settings.SQS_QUIZ_UPLOAD_QUEUE_URL
 
     tasks = []
 
@@ -284,6 +364,15 @@ async def run_sqs_workers() -> None:
         logger.info("  ✅ SQS grading worker started")
     else:
         logger.warning("  ⚠️  SQS_GRADING_QUEUE_URL not set — grading SQS worker disabled")
+
+    if quiz_upload_url:
+        tasks.append(asyncio.create_task(
+            _poll_queue(quiz_upload_url, "quiz-upload", _process_quiz_upload_message),
+            name="sqs-quiz-upload",
+        ))
+        logger.info("  ✅ SQS quiz-upload worker started")
+    else:
+        logger.warning("  ⚠️  SQS_QUIZ_UPLOAD_QUEUE_URL not set — quiz-upload SQS worker disabled")
 
     if tasks:
         await asyncio.gather(*tasks)

@@ -18,6 +18,9 @@ class QuizUploadJob(BaseModel):
     extracted_count = Column("ExtractedCount", Integer, default=0, nullable=False)
     error_message = Column("ErrorMessage", Text, nullable=True)
     processed_at = Column("ProcessedAt", DateTime(timezone=True), nullable=True)
+    input_s3_key = Column("InputS3Key", String(500), nullable=True)
+    original_filename = Column("OriginalFilename", String(255), nullable=True)
+    extracted_questions_json = Column("ExtractedQuestionsJson", Text, nullable=True)
 
     __table_args__ = (
         CheckConstraint(
