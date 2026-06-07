@@ -63,14 +63,20 @@ Language: {tutor_language}
 CONTENT:
 {file_content[:50000]}
 
-For each question found, structure it as follows. If the correct answer is not explicitly marked, use your best judgment based on the content.
+IMPORTANT — CONTEXT BLOCKS:
+Many questions in this type of document are preceded by a context/background paragraph (often labeled "Contextualização:", "Contexto:", "Situação:", or similar, or simply an introductory paragraph before "Pergunta:").
+When a context block is present before a question, you MUST include it in the "question" field using this exact format:
+  "[context paragraph text]\n\n[question text]"
+Do NOT discard the context — it is essential for understanding and answering the question correctly.
+
+For each question found, structure it as follows. If the correct answer is not explicitly marked (e.g., via a "Feedback:" or "Gabarito:" section), use your best judgment based on the content.
 
 CRITICAL: The "correct_answer" field MUST be the actual correct option letter for each question. Do NOT always use "A" — each question has its own correct answer which could be A, B, C, D, or E.
 
 Respond with JSON:
 {{"questions": [
   {{
-    "question": "The question text exactly as found",
+    "question": "Context paragraph (if any).\\n\\nThe question text exactly as found",
     "options": {{
       "A": {{"text": "Option A text", "explanation": "Why A is correct/incorrect (2-3 sentences)"}},
       "B": {{"text": "Option B text", "explanation": "Why B is correct/incorrect"}},
@@ -83,7 +89,7 @@ Respond with JSON:
   }}
 ]}}
 
-Extract ALL questions. If a question has 5 options, include option E. The correct_answer varies per question — identify it from the document content."""
+Extract ALL questions. If a question has 5 options, include option E. The correct_answer varies per question — identify it from the document content (check Feedback/Gabarito sections)."""
 
         # Call AI
         response_text = await self._call_ai(system_prompt, user_prompt)
