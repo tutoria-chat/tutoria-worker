@@ -39,7 +39,8 @@ class Settings(BaseSettings):
     FILE_PROCESSING_PROVIDER: str = "gemini"
     FILE_PROCESSING_FALLBACK_CHAIN: str = "openai"
 
-    # Encryption key for DB-managed provider keys (must match tutoria-api)
+    # DB-managed provider keys (must match tutoria-api setting)
+    USE_DB_PROVIDER_KEYS: bool = True
     ENCRYPTION_KEY: Optional[str] = None
 
     # Retry & Reliability
