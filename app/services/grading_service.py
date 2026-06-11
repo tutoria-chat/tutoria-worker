@@ -41,17 +41,28 @@ MAX_CONTEXT_CHARS = 25_000
 
 
 # ---------------------------------------------------------------------------
-# HTML stripper (for question_text_html fallback)
+# HTML stripper + base64 image extractor
 # ---------------------------------------------------------------------------
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _WHITESPACE_RE = re.compile(r"\s+")
+_BASE64_IMG_RE = re.compile(
+    r'<img[^>]+src=["\']?(data:image/[^;]+;base64,[A-Za-z0-9+/=]+)["\']?',
+    re.IGNORECASE,
+)
+# Cap images per question to avoid blowing API limits (base64 images are large)
+_MAX_IMAGES_PER_QUESTION = 3
 
 
 def _strip_html(html: str) -> str:
     """Remove HTML tags and collapse whitespace."""
     text = _HTML_TAG_RE.sub(" ", html)
     return _WHITESPACE_RE.sub(" ", text).strip()
+
+
+def _extract_base64_images(html: str) -> list[str]:
+    """Return a list of data URIs ('data:image/png;base64,...') found in HTML."""
+    return _BASE64_IMG_RE.findall(html)[:_MAX_IMAGES_PER_QUESTION]
 
 
 def _get_question_text(q: dict) -> str:
@@ -67,18 +78,39 @@ def _get_question_text(q: dict) -> str:
     return _strip_html(html) if html else ""
 
 
+def _get_question_images(q: dict) -> list[str]:
+    """
+    Extract base64 images embedded in the question HTML and/or answer HTML.
+    Covers both question context images and image-based student answers.
+    """
+    images: list[str] = []
+    for field in ("question_text_html", "answer_html"):
+        html = str(q.get(field) or "").strip()
+        if html:
+            images.extend(_extract_base64_images(html))
+    # Also handle plain answer field if it looks like HTML with an img tag
+    answer_raw = str(q.get("answer") or q.get("answer_text") or "").strip()
+    if answer_raw and "<img" in answer_raw:
+        images.extend(_extract_base64_images(answer_raw))
+    return images[:_MAX_IMAGES_PER_QUESTION]
+
+
 def _get_answer(q: dict) -> str:
     """
     Return the student's answer, accepting several field names used across
-    Moodle export versions.
+    Moodle export versions. Strips HTML if the answer contains markup.
     """
-    return str(
+    raw = str(
         q.get("answer")
         or q.get("answer_text")
         or q.get("response")
         or q.get("responsesummary")
         or ""
     ).strip()
+    # If the answer is HTML (e.g. rich text editor output), strip tags for the text portion
+    if raw and ("<" in raw and ">" in raw):
+        return _strip_html(raw)
+    return raw
 
 
 # ---------------------------------------------------------------------------
@@ -182,16 +214,50 @@ def _get_provider_chain(db: Session) -> list[dict]:
     return chain
 
 
+def _build_user_content(user_prompt: str, images: list[str], provider: str) -> Any:
+    """
+    Build the user message content for the given provider.
+    Returns a plain string when there are no images (universal compatibility).
+    Returns a multimodal list when images are present, formatted per provider.
+    DeepSeek has no vision support — images are ignored (noted in prompt instead).
+    """
+    if not images or provider == "deepseek":
+        return user_prompt
+
+    if provider == "anthropic":
+        content: list = []
+        for data_uri in images:
+            try:
+                header, b64data = data_uri.split(";base64,", 1)
+                media_type = header.split(":", 1)[1]   # e.g. "image/png"
+                content.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": media_type, "data": b64data},
+                })
+            except Exception:
+                pass  # malformed URI — skip
+        content.append({"type": "text", "text": user_prompt})
+        return content
+
+    # OpenAI-compatible format (openai, gemini, xai)
+    content = [{"type": "text", "text": user_prompt}]
+    for data_uri in images:
+        content.append({"type": "image_url", "image_url": {"url": data_uri}})
+    return content
+
+
 async def _call_provider(
     provider: str,
     model_name: Optional[str],
     system_prompt: str,
     user_prompt: str,
     db: Session,
+    images: Optional[list[str]] = None,
 ) -> Optional[str]:
     """Call a single AI provider and return raw text response."""
     from types import SimpleNamespace
 
+    images = images or []
     dummy = SimpleNamespace(id=0, ai_model=None, ai_model_id=None, name="grading")
 
     if provider == "anthropic":
@@ -201,7 +267,8 @@ async def _call_provider(
             logger.error("anthropic package not installed; skipping")
             return None
         svc = AnthropicService(module=dummy, model_name=model_name, db=db)
-        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+        user_content = _build_user_content(user_prompt, images, "anthropic")
+        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}]
         result = await svc.answer_question_with_history(messages)
         return result.get("response", "")
 
@@ -227,9 +294,10 @@ async def _call_provider(
         logger.warning("Unsupported grading provider: %s", provider)
         return None
 
+    user_content = _build_user_content(user_prompt, images, provider)
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
+        {"role": "user", "content": user_content},
     ]
     response = await client.chat.completions.create(
         model=svc.model_name,
@@ -240,13 +308,15 @@ async def _call_provider(
     return response.choices[0].message.content
 
 
-async def _call_ai(system_prompt: str, user_prompt: str, db: Session) -> str:
+async def _call_ai(system_prompt: str, user_prompt: str, db: Session, images: Optional[list[str]] = None) -> str:
     """Try each provider in the chain; raise if all fail."""
     chain = _get_provider_chain(db)
     last_error = None
     for entry in chain:
         try:
-            result = await _call_provider(entry["provider"], entry.get("model"), system_prompt, user_prompt, db)
+            result = await _call_provider(
+                entry["provider"], entry.get("model"), system_prompt, user_prompt, db, images
+            )
             if result:
                 return result
         except Exception as exc:
@@ -549,7 +619,8 @@ class GradingService:
                     "question_text": question_text,
                     "answer": answer,
                     "max_mark": max_mark,
-                    "cmid": cmid,  # carry per-question cmid through
+                    "cmid": cmid,
+                    "images": _get_question_images(q),
                 })
 
         if not ai_questions:
@@ -585,20 +656,28 @@ class GradingService:
         """
         One AI call that grades all questions for a single student.
         Returns [{slot, grade, comment}] — one entry per question.
+        Passes base64 images (from question HTML or answer HTML) as multimodal content.
         """
-        questions_json = json.dumps(
-            [
-                {
-                    "slot": q["slot"],
-                    "question": q["question_text"],
-                    "answer": q["answer"],
-                    "max_mark": q["max_mark"],
-                }
-                for q in questions
-            ],
-            ensure_ascii=False,
-            indent=2,
-        )
+        # Collect all images across this student's questions, tagged by slot
+        all_images: list[str] = []
+        for q in questions:
+            imgs = q.get("images") or []
+            all_images.extend(imgs)
+
+        # Build questions payload; note image presence per slot so the model knows
+        questions_payload = []
+        for q in questions:
+            entry: dict = {
+                "slot": q["slot"],
+                "question": q["question_text"],
+                "answer": q["answer"],
+                "max_mark": q["max_mark"],
+            }
+            if q.get("images"):
+                entry["note"] = f"This question/answer includes {len(q['images'])} image(s) attached to this message."
+            questions_payload.append(entry)
+
+        questions_json = json.dumps(questions_payload, ensure_ascii=False, indent=2)
 
         context_section = (
             f"Course content:\n{course_context}\n\n" if course_context.strip() else ""
@@ -610,9 +689,16 @@ class GradingService:
             else ""
         )
 
+        image_note = (
+            f"\nNote: {len(all_images)} image(s) are attached to this message. "
+            "Use them to evaluate questions/answers that reference visual content.\n"
+            if all_images else ""
+        )
+
         system_prompt = (
             "You are an academic grader. Evaluate each student answer based on the "
             "course content provided and the question. "
+            "When images are attached, use them to interpret visual questions or answers. "
             "Assign a decimal grade between 0 and max_mark. "
             "Write brief, constructive feedback in the SAME LANGUAGE as the question. "
             "Return ONLY valid JSON — no markdown, no explanation outside JSON."
@@ -621,13 +707,14 @@ class GradingService:
         user_prompt = (
             f"{context_section}"
             f"{criteria_section}"
+            f"{image_note}"
             f"Grade the following student answers:\n{questions_json}\n\n"
             "Return a JSON array:\n"
             '[{"slot": <number>, "grade": <decimal 0..max_mark>, "comment": "<feedback>"}]\n'
             "One entry per question. No other text."
         )
 
-        response_text = await _call_ai(system_prompt, user_prompt, self.db)
+        response_text = await _call_ai(system_prompt, user_prompt, self.db, images=all_images or None)
         return _parse_grading_response(response_text, questions)
 
 
