@@ -2,7 +2,7 @@
 Grading Service - AI-powered batch grading of student written answers.
 
 Input  : JSON file uploaded to S3 (Moodle-compatible format)
-Output : CSV  → S3  (matricula,email,cmid,slot,nota,comentario)
+Output : CSV  → S3  (matricula,email,cmid,slot,nota,comentario,max_mark,name,question_text,answer)
 
 Flow:
   1. Load GradingJob from DB, set status → processing
@@ -38,6 +38,47 @@ logger = logging.getLogger(__name__)
 
 # Maximum course context characters sent to the AI (prevents context window overflow)
 MAX_CONTEXT_CHARS = 25_000
+
+
+# ---------------------------------------------------------------------------
+# HTML stripper (for question_text_html fallback)
+# ---------------------------------------------------------------------------
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _strip_html(html: str) -> str:
+    """Remove HTML tags and collapse whitespace."""
+    text = _HTML_TAG_RE.sub(" ", html)
+    return _WHITESPACE_RE.sub(" ", text).strip()
+
+
+def _get_question_text(q: dict) -> str:
+    """
+    Return the best available question text.
+    Prefers plain-text 'question_text'; falls back to stripping HTML from
+    'question_text_html' (present in newer Moodle exports).
+    """
+    plain = str(q.get("question_text") or "").strip()
+    if plain:
+        return plain
+    html = str(q.get("question_text_html") or "").strip()
+    return _strip_html(html) if html else ""
+
+
+def _get_answer(q: dict) -> str:
+    """
+    Return the student's answer, accepting several field names used across
+    Moodle export versions.
+    """
+    return str(
+        q.get("answer")
+        or q.get("answer_text")
+        or q.get("response")
+        or q.get("responsesummary")
+        or ""
+    ).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +460,7 @@ class GradingService:
                 )
                 email = str(submission.get("email", ""))
                 sub_cmid = str(submission.get("quiz_cmid") or submission.get("cmid") or "")
+                sub_name = str(submission.get("name", ""))
                 for q in submission.get("questions", []):
                     q_cmid = sub_cmid or str(q.get("quiz_cmid") or q.get("cmid") or "")
                     csv_rows.append({
@@ -428,6 +470,10 @@ class GradingService:
                         "slot": str(q.get("slot", "")),
                         "nota": "0",
                         "comentario": _sanitize_comment(f"Erro ao processar: {str(exc)[:200]}"),
+                        "max_mark": str(q.get("max_mark", "") or ""),
+                        "name": sub_name,
+                        "question_text": _get_question_text(q),
+                        "answer": _get_answer(q),
                     })
                 processed += 1
                 job.processed_submissions = processed
@@ -466,6 +512,7 @@ class GradingService:
             or submission.get("student_id")
             or ""
         )
+        name = str(submission.get("name", ""))
         email = str(submission.get("email", ""))
         # Submission-level cmid (falls back to question-level per question)
         submission_cmid = str(submission.get("quiz_cmid") or submission.get("cmid") or "")
@@ -476,8 +523,9 @@ class GradingService:
 
         for q in questions:
             slot = str(q.get("slot", ""))
-            answer = str(q.get("answer") or "").strip()
+            answer = _get_answer(q)
             max_mark = str(q.get("max_mark", "1") or "1")
+            question_text = _get_question_text(q)
             # Prefer question-level cmid when submission-level is absent
             cmid = submission_cmid or str(q.get("quiz_cmid") or q.get("cmid") or "")
 
@@ -490,11 +538,15 @@ class GradingService:
                     "slot": slot,
                     "nota": "0",
                     "comentario": "Resposta não fornecida",
+                    "max_mark": max_mark,
+                    "name": name,
+                    "question_text": question_text,
+                    "answer": answer,
                 })
             else:
                 ai_questions.append({
                     "slot": q.get("slot"),
-                    "question_text": str(q.get("question_text") or "").strip(),
+                    "question_text": question_text,
                     "answer": answer,
                     "max_mark": max_mark,
                     "cmid": cmid,  # carry per-question cmid through
@@ -507,18 +559,22 @@ class GradingService:
         graded = await self._call_ai_for_student(ai_questions, course_context, grading_criteria)
 
         for result in graded:
-            # Retrieve the cmid that was associated with this slot
-            q_cmid = next(
-                (q["cmid"] for q in ai_questions if str(q["slot"]) == str(result["slot"])),
-                submission_cmid,
+            # Retrieve the original question data for this slot
+            orig_q = next(
+                (q for q in ai_questions if str(q["slot"]) == str(result["slot"])),
+                {},
             )
             rows.append({
                 "matricula": matricula,
                 "email": email,
-                "cmid": q_cmid,
+                "cmid": orig_q.get("cmid", submission_cmid),
                 "slot": str(result["slot"]),
                 "nota": _format_nota(result["grade"]),
                 "comentario": _sanitize_comment(result["comment"]),
+                "max_mark": orig_q.get("max_mark", ""),
+                "name": name,
+                "question_text": orig_q.get("question_text", ""),
+                "answer": orig_q.get("answer", ""),
             })
 
         return rows
@@ -582,7 +638,7 @@ class GradingService:
 def _build_csv(rows: list[dict]) -> bytes:
     """
     Serialize rows to UTF-8-with-BOM CSV bytes.
-    Header: matricula,email,cmid,slot,nota,comentario
+    Header: matricula,email,cmid,slot,nota,comentario,max_mark,name,question_text,answer
 
     - UTF-8 BOM (﻿) ensures Excel on Windows (Portuguese locale) opens correctly.
     - QUOTE_ALL ensures every field is quoted, preventing any in-field comma from
@@ -591,7 +647,7 @@ def _build_csv(rows: list[dict]) -> bytes:
     output = io.StringIO()
     writer = csv.DictWriter(
         output,
-        fieldnames=["matricula", "email", "cmid", "slot", "nota", "comentario"],
+        fieldnames=["matricula", "email", "cmid", "slot", "nota", "comentario", "max_mark", "name", "question_text", "answer"],
         extrasaction="ignore",
         lineterminator="\r\n",   # Windows-style line endings for Excel compatibility
         quoting=csv.QUOTE_ALL,
