@@ -13,6 +13,7 @@ from app.workers.sqs_worker import run_sqs_workers
 from app.workers.analytics_aggregation_worker import run_analytics_aggregation_worker
 from app.workers.topic_classification_worker import run_topic_classification_worker
 from app.workers.quiz_analytics_worker import run_quiz_analytics_worker
+from app.workers.ai_summary_worker import run_ai_summary_worker
 from app.workers.ttl_backfill_worker import run_ttl_backfill
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,9 @@ async def lifespan(app: FastAPI):
 
     tasks.append(asyncio.create_task(run_quiz_analytics_worker(), name="quiz-analytics"))
     logger.info("  ✅ Quiz analytics worker scheduled (daily @ 3:30 AM)")
+
+    tasks.append(asyncio.create_task(run_ai_summary_worker(), name="daily-ai-summary"))
+    logger.info("  ✅ Daily AI summary worker scheduled (daily @ 4:00 AM)")
 
     # One-time TTL backfill (enable once, run, disable)
     if settings.TTL_BACKFILL_ENABLED:
