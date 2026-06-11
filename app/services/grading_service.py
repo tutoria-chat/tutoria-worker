@@ -46,6 +46,9 @@ MAX_CONTEXT_CHARS = 25_000
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _WHITESPACE_RE = re.compile(r"\s+")
+_SLUG_UNSAFE_RE = re.compile(r"[^\w\s-]")
+_SLUG_WHITESPACE_RE = re.compile(r"[\s_-]+")
+
 _BASE64_IMG_RE = re.compile(
     r'<img[^>]+src=["\']?(data:image/[^;]+;base64,[A-Za-z0-9+/=]+)["\']?',
     re.IGNORECASE,
@@ -58,6 +61,13 @@ def _strip_html(html: str) -> str:
     """Remove HTML tags and collapse whitespace."""
     text = _HTML_TAG_RE.sub(" ", html)
     return _WHITESPACE_RE.sub(" ", text).strip()
+
+
+def _slugify(name: str, max_len: int = 40) -> str:
+    """Convert a course name into a safe filename slug."""
+    slug = _SLUG_UNSAFE_RE.sub("", name.lower())
+    slug = _SLUG_WHITESPACE_RE.sub("_", slug)
+    return slug.strip("_")[:max_len] or "course"
 
 
 def _extract_base64_images(html: str) -> list[str]:
@@ -460,6 +470,11 @@ class GradingService:
     def __init__(self, db: Session):
         self.db = db
 
+    def _get_course_name(self, course_id: int) -> str:
+        from app.models import Course
+        course = self.db.query(Course).filter(Course.id == course_id).first()
+        return course.name if course else f"course_{course_id}"
+
     async def process_job(self, job_id: int, course_id: int) -> None:
         """
         Full processing cycle for one grading job.
@@ -549,8 +564,11 @@ class GradingService:
                 job.processed_submissions = processed
                 self.db.commit()
 
-        # 4. Build and upload CSV
-        result_key = f"grading-jobs/{course_id}/{job.id}/result.csv"
+        # 4. Build and upload CSV — filename: COURSENAME_DATEUTC_JOBID.csv
+        course_slug = _slugify(self._get_course_name(course_id))
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        result_filename = f"{course_slug}_{date_str}_{job.id}.csv"
+        result_key = f"grading-jobs/{course_id}/{job.id}/{result_filename}"
         csv_bytes = _build_csv(csv_rows)
         logger.info("Uploading result CSV (%d bytes) to %s", len(csv_bytes), result_key)
         await _upload_s3_csv(result_key, csv_bytes)
