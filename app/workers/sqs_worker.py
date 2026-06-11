@@ -234,6 +234,49 @@ async def _process_quiz_upload_message(body: dict) -> None:
         db.close()
 
 
+async def _process_feedback_message(body: dict) -> None:
+    """
+    Generate AI feedback for a student's assignment submission (companion widget).
+    Message: { "submission_id": 1, "assignment_id": 2, "module_id": 3,
+               "conversation_id": "uuid", "student_id": 42, "matricula": "MAT123" }
+    """
+    submission_id: Optional[int] = body.get("submission_id")
+    conversation_id: Optional[str] = body.get("conversation_id")
+
+    if not submission_id:
+        raise ValueError(f"Missing submission_id in feedback message: {body}")
+    if not conversation_id:
+        raise ValueError(f"Missing conversation_id in feedback message: {body}")
+
+    db = SessionLocal()
+    try:
+        from app.services.feedback_service import process_feedback_job
+
+        try:
+            await process_feedback_job(
+                db,
+                submission_id=submission_id,
+                conversation_id=conversation_id,
+                matricula=body.get("matricula"),
+            )
+        except Exception:
+            # Mark failed when this was the last delivery attempt — afterwards the
+            # message goes to the DLQ and the widget would otherwise poll forever.
+            receive_count = body.get("_receive_count", 1)
+            if receive_count >= 3:
+                from app.models import AssignmentSubmission as _Sub
+                db.rollback()
+                sub = db.query(_Sub).filter(_Sub.id == submission_id).first()
+                if sub and sub.status == "processing":
+                    sub.status = "failed"
+                    db.commit()
+                    logger.error("⛔ Feedback marked failed after %s attempts — submission_id=%s",
+                                 receive_count, submission_id)
+            raise
+    finally:
+        db.close()
+
+
 async def _process_grading_message(body: dict) -> None:
     """Grade a batch of student answers and upload a CSV result to S3."""
     job_id: Optional[int] = body.get("job_id")
@@ -290,6 +333,10 @@ async def _poll_queue(queue_url: str, queue_name: str, handler) -> None:
                 body = json.loads(msg["Body"])
                 logger.info("📨 Received %s message (attempt %s): %s", queue_name, receive_count, body)
 
+                # Let handlers know which delivery attempt this is (e.g. to mark
+                # a job failed on the final attempt before the DLQ swallows it)
+                body["_receive_count"] = receive_count
+
                 await handler(body)
 
                 # Delete only after success (also non-blocking)
@@ -326,6 +373,7 @@ async def run_sqs_workers() -> None:
     transcription_url = settings.SQS_TRANSCRIPTION_QUEUE_URL
     grading_url = settings.SQS_GRADING_QUEUE_URL
     quiz_upload_url = settings.SQS_QUIZ_UPLOAD_QUEUE_URL
+    feedback_url = settings.SQS_FEEDBACK_QUEUE_URL
 
     tasks = []
 
@@ -373,6 +421,15 @@ async def run_sqs_workers() -> None:
         logger.info("  ✅ SQS quiz-upload worker started")
     else:
         logger.warning("  ⚠️  SQS_QUIZ_UPLOAD_QUEUE_URL not set — quiz-upload SQS worker disabled")
+
+    if feedback_url:
+        tasks.append(asyncio.create_task(
+            _poll_queue(feedback_url, "feedback", _process_feedback_message),
+            name="sqs-feedback",
+        ))
+        logger.info("  ✅ SQS feedback worker started")
+    else:
+        logger.warning("  ⚠️  SQS_FEEDBACK_QUEUE_URL not set — feedback SQS worker disabled")
 
     if tasks:
         await asyncio.gather(*tasks)

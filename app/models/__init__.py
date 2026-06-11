@@ -20,6 +20,8 @@ from .analytics_daily_summary import AnalyticsDailySummary
 from .topic_classification import TopicClassification
 from .quiz_analytics import QuizAnalytic
 from .grading_job import GradingJob
+from .assignment import Assignment
+from .assignment_submission import AssignmentSubmission
 from .base import Base
 
 __all__ = [
@@ -43,5 +45,7 @@ __all__ = [
     "TopicClassification",
     "QuizAnalytic",
     "GradingJob",
+    "Assignment",
+    "AssignmentSubmission",
     "Base",
 ]
