@@ -1,8 +1,10 @@
 """
 Quiz Analytics Worker — Daily Background Job
 
-Runs at 3:30 AM. Queries yesterday's QuizAttempts from DynamoDB per module,
-aggregates pass/fail per concept, stores in QuizAnalytics SQL.
+Runs at 3:30 AM. Rebuilds QuizAnalytics SQL from the full DynamoDB retention
+window (raw QuizAttempts auto-expire at 90 days via TTL), aggregating pass/fail
+per concept per module. The dashboard shows a date range, so the aggregate must
+be cumulative over that window — not a single day.
 """
 import asyncio
 import logging
@@ -18,33 +20,42 @@ logger = logging.getLogger(__name__)
 QUIZ_ANALYTICS_HOUR = 3
 QUIZ_ANALYTICS_MINUTE = 30
 
+# Match the DynamoDB TTL on QuizAttempts so the aggregate covers every retained
+# attempt, not just yesterday's.
+QUIZ_ANALYTICS_WINDOW_DAYS = 90
 
-async def aggregate_quiz_analytics():
-    """Aggregate yesterday's quiz attempts into QuizAnalytics."""
+
+async def aggregate_quiz_analytics(window_days: int = QUIZ_ANALYTICS_WINDOW_DAYS) -> int:
+    """
+    Rebuild QuizAnalytics from the last `window_days` of DynamoDB quiz attempts.
+
+    Returns the number of modules whose aggregates were rebuilt.
+    """
     from app.models.module import Module
     from app.models.quiz_analytics import QuizAnalytic
     from app.services.dynamodb_service import query_module_quiz_attempts
 
-    yesterday = date.today() - timedelta(days=1)
-    start_of_day = datetime.combine(yesterday, datetime.min.time(), tzinfo=timezone.utc)
-    end_of_day = datetime.combine(yesterday, datetime.max.time(), tzinfo=timezone.utc)
-    start_ts = int(start_of_day.timestamp() * 1000)
-    end_ts = int(end_of_day.timestamp() * 1000)
+    now = datetime.now(timezone.utc)
+    start_ts = int((now - timedelta(days=window_days)).timestamp() * 1000)
+    end_ts = int(now.timestamp() * 1000)
 
     db = SessionLocal()
     try:
         modules = db.query(Module).filter(Module.is_active == True).all()
         if not modules:
             logger.info("No active modules found, skipping quiz analytics")
-            return
+            return 0
 
         aggregated = 0
         for module in modules:
             try:
                 attempts = await asyncio.to_thread(query_module_quiz_attempts, module.id, start_ts, end_ts)
-                if not attempts:
-                    continue
+            except Exception as e:
+                # Query failed — leave this module's existing aggregate untouched.
+                logger.error(f"Error querying quiz attempts for module {module.id}: {e}")
+                continue
 
+            try:
                 # Group by concept
                 concepts = defaultdict(lambda: {"total": 0, "correct": 0, "incorrect": 0, "difficulty": None})
 
@@ -64,10 +75,9 @@ async def aggregate_quiz_analytics():
                             concepts[concept]["incorrect"] += 1
                         concepts[concept]["difficulty"] = difficulty
 
-                # Delete existing QuizAnalytics for this module
+                # Rebuild this module's aggregate (clears stale concepts too).
                 db.query(QuizAnalytic).filter(QuizAnalytic.module_id == module.id).delete()
 
-                # Insert fresh aggregated rows
                 for concept_name, stats in concepts.items():
                     total = stats["total"]
                     correct = stats["correct"]
@@ -85,18 +95,21 @@ async def aggregate_quiz_analytics():
                     )
                     db.add(qa)
 
-                aggregated += 1
+                if attempts:
+                    aggregated += 1
 
             except Exception as e:
                 logger.error(f"Error aggregating quiz analytics for module {module.id}: {e}")
                 continue
 
         db.commit()
-        logger.info(f"✅ Quiz analytics aggregation complete: {aggregated} modules")
+        logger.info(f"✅ Quiz analytics aggregation complete: {aggregated} modules (window={window_days}d)")
+        return aggregated
 
     except Exception as e:
         logger.error(f"Error in quiz analytics aggregation: {e}")
         db.rollback()
+        return 0
     finally:
         db.close()
 
