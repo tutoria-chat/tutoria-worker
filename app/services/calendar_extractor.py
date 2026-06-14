@@ -196,8 +196,10 @@ class CalendarExtractorService:
             if not re.match(r"^\d{2}:\d{2}$", time_val):
                 time_val = ""
             events.append({
+                # key is "eventType" so it round-trips into the .NET DTO and back
+                # out to the UI as camelCase without custom mapping.
                 "title": title[:255],
-                "type": etype,
+                "eventType": etype,
                 "date": date,
                 "time": time_val,
                 "description": str(item.get("description", "") or "").strip()[:2000],
