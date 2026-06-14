@@ -29,6 +29,7 @@ class ProcessCalendarRequest(BaseModel):
     course_id: int
     s3_key: str | None = None
     filename: str | None = None
+    ics_url: str | None = None
 
 
 @router.post("/process")
@@ -47,37 +48,43 @@ async def process_calendar_import(
         raise HTTPException(status_code=404, detail=f"CalendarImportJob {payload.job_id} not found")
 
     s3_key = payload.s3_key or job.input_s3_key
-    if not s3_key:
-        raise HTTPException(status_code=400, detail="No input file for this job")
+    if not payload.ics_url and not s3_key:
+        raise HTTPException(status_code=400, detail="No input file or calendar URL for this job")
 
     try:
         job.status = "processing"
         db.commit()
 
-        s3 = boto3.client(
-            "s3",
-            region_name=settings.AWS_REGION,
-            aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-        )
-        response = await asyncio.to_thread(
-            s3.get_object, Bucket=settings.S3_BUCKET_NAME, Key=s3_key
-        )
-        content = response["Body"].read()
+        if payload.ics_url:
+            # iCal feed import: fetch + parse structured VEVENTs (no AI needed).
+            from app.services.ics_importer import fetch_ics, parse_ics
+            ics_text = await asyncio.to_thread(fetch_ics, payload.ics_url)
+            events = parse_ics(ics_text)
+        else:
+            s3 = boto3.client(
+                "s3",
+                region_name=settings.AWS_REGION,
+                aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+                aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+            )
+            response = await asyncio.to_thread(
+                s3.get_object, Bucket=settings.S3_BUCKET_NAME, Key=s3_key
+            )
+            content = response["Body"].read()
 
-        filename = payload.filename or job.original_filename or s3_key.rsplit("/", 1)[-1]
+            filename = payload.filename or job.original_filename or s3_key.rsplit("/", 1)[-1]
 
-        text_content = extract_text_from_file(content, filename)
-        if not text_content.strip():
-            raise ValueError("Could not extract text from file. It may be empty, scanned, or corrupted.")
+            text_content = extract_text_from_file(content, filename)
+            if not text_content.strip():
+                raise ValueError("Could not extract text from file. It may be empty, scanned, or corrupted.")
 
-        course = db.query(Course).filter(Course.id == payload.course_id).first()
-        extractor = CalendarExtractorService(
-            db,
-            course_name=getattr(course, "name", "") or "",
-            year_hint=datetime.now(timezone.utc).year,
-        )
-        events = await extractor.extract_from_text(text_content, filename)
+            course = db.query(Course).filter(Course.id == payload.course_id).first()
+            extractor = CalendarExtractorService(
+                db,
+                course_name=getattr(course, "name", "") or "",
+                year_hint=datetime.now(timezone.utc).year,
+            )
+            events = await extractor.extract_from_text(text_content, filename)
 
         job.extracted_events_json = _json.dumps(events, ensure_ascii=False)
         job.extracted_count = len(events)
