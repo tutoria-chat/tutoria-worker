@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.routes import modules, analytics_admin
+from app.api.routes import modules, analytics_admin, calendar
 from app.core.config import settings
 from app.core.swagger_config import custom_openapi
 from app.workers.document_extraction_worker import run_extraction_worker, run_failed_extraction_retry_worker
@@ -127,6 +127,15 @@ app.include_router(
 app.include_router(
     analytics_admin.router,
     tags=["📊 Analytics"],
+    responses={
+        401: {"description": "Authentication required"},
+        403: {"description": "Access denied"},
+    },
+)
+
+app.include_router(
+    calendar.router,
+    tags=["📅 Calendar"],
     responses={
         401: {"description": "Authentication required"},
         403: {"description": "Access denied"},

@@ -16,6 +16,7 @@ from .university_course_type_model import UniversityCourseTypeModel
 from .plan import Plan
 from .subscription import Subscription
 from .quiz_upload_job import QuizUploadJob
+from .calendar_import_job import CalendarImportJob
 from .analytics_daily_summary import AnalyticsDailySummary
 from .topic_classification import TopicClassification
 from .quiz_analytics import QuizAnalytic
@@ -42,6 +43,7 @@ __all__ = [
     "Plan",
     "Subscription",
     "QuizUploadJob",
+    "CalendarImportJob",
     "AnalyticsDailySummary",
     "TopicClassification",
     "QuizAnalytic",
