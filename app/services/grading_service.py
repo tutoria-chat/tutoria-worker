@@ -123,6 +123,34 @@ def _get_answer(q: dict) -> str:
     return raw
 
 
+def _get_gabarito(q: dict) -> str:
+    """
+    Return the question's reference answer / rubric (Moodle "general feedback"),
+    which typically holds the "Gabarito orientador" + expected feedback. Used as
+    the primary grading reference when present. HTML is stripped.
+    """
+    raw = str(
+        q.get("feedback")
+        or q.get("general_feedback")
+        or q.get("generalfeedback")
+        or q.get("gabarito")
+        or ""
+    ).strip()
+    return _strip_html(raw) if raw else ""
+
+
+_EMAIL_PREFIX_RE = re.compile(r"^\s*\d+\s*,\s*")
+
+
+def _clean_email(email: str) -> str:
+    """
+    Strip the leading "<n>, " sequence prefix some Moodle exports prepend
+    (e.g. "1, aluno@example.com" → "aluno@example.com"). Emails never start
+    with digits+comma, so this is safe.
+    """
+    return _EMAIL_PREFIX_RE.sub("", str(email or "")).strip()
+
+
 # ---------------------------------------------------------------------------
 # Key normalizer
 # ---------------------------------------------------------------------------
@@ -601,7 +629,7 @@ class GradingService:
             or ""
         )
         name = str(submission.get("name", ""))
-        email = str(submission.get("email", ""))
+        email = _clean_email(submission.get("email", ""))
         # Submission-level cmid (falls back to question-level per question)
         submission_cmid = str(submission.get("quiz_cmid") or submission.get("cmid") or "")
         questions: list[dict] = submission.get("questions", [])
@@ -638,6 +666,7 @@ class GradingService:
                     "answer": answer,
                     "max_mark": max_mark,
                     "cmid": cmid,
+                    "gabarito": _get_gabarito(q),
                     "images": _get_question_images(q),
                 })
 
@@ -691,6 +720,10 @@ class GradingService:
                 "answer": q["answer"],
                 "max_mark": q["max_mark"],
             }
+            # The reference answer / rubric ("gabarito") from the question, when present —
+            # the AI should grade primarily against this.
+            if q.get("gabarito"):
+                entry["reference_answer"] = q["gabarito"]
             if q.get("images"):
                 entry["note"] = f"This question/answer includes {len(q['images'])} image(s) attached to this message."
             questions_payload.append(entry)
@@ -714,8 +747,11 @@ class GradingService:
         )
 
         system_prompt = (
-            "You are an academic grader. Evaluate each student answer based on the "
-            "course content provided and the question. "
+            "You are an academic grader. Evaluate each student answer against the question. "
+            "If a question includes a 'reference_answer' (the official answer key / gabarito), "
+            "grade PRIMARILY by how well the student's answer matches it, awarding partial credit "
+            "for partially-correct answers; use the course content only as supporting context. "
+            "If there is no reference_answer, judge against the course content and the question. "
             "When images are attached, use them to interpret visual questions or answers. "
             "Assign a decimal grade between 0 and max_mark. "
             "Write brief, constructive feedback in the SAME LANGUAGE as the question. "
