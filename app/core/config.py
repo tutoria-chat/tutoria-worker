@@ -39,8 +39,8 @@ class Settings(BaseSettings):
     FILE_PROCESSING_PROVIDER: str = "gemini"
     FILE_PROCESSING_FALLBACK_CHAIN: str = "openai"
 
-    # DB-managed provider keys (must match tutoria-api setting)
-    USE_DB_PROVIDER_KEYS: bool = True
+    # DB-managed provider keys are always used when a DB session is available
+    # (env-var keys remain the fallback). See gemini/deepseek/xai services.
     ENCRYPTION_KEY: Optional[str] = None
 
     # Retry & Reliability

@@ -56,7 +56,7 @@ class DeepSeekService:
         self._key_id: Optional[int] = None
         resolved_key = api_key
 
-        if not resolved_key and settings.USE_DB_PROVIDER_KEYS and db:
+        if not resolved_key and db:
             try:
                 from app.services.key_manager import KeyManager
 
