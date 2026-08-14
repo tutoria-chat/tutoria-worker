@@ -21,6 +21,12 @@ class Course(BaseModel):
     students = relationship(
         "Student", back_populates="course", cascade="all, delete-orphan"
     )
+    assignments = relationship(
+        "Assignment", back_populates="course", cascade="all, delete-orphan"
+    )
+    quizzes = relationship(
+        "Quiz", back_populates="course", cascade="all, delete-orphan"
+    )
 
     # Legacy professor relationship (DISABLED - incompatible with current FK setup)
     # ProfessorCourses.ProfessorId now references Users.UserId, not Professors.Id

@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.routes import modules, analytics_admin, calendar
+from app.api.routes import modules, courses, analytics_admin, calendar
 from app.core.config import settings
 from app.core.swagger_config import custom_openapi
 from app.workers.document_extraction_worker import run_extraction_worker, run_failed_extraction_retry_worker
@@ -116,11 +116,21 @@ app.add_middleware(
 
 app.include_router(
     modules.router,
-    tags=["📖 Modules & Quizzes"],
+    tags=["📖 Modules"],
     responses={
         401: {"description": "Authentication required"},
         403: {"description": "Access denied"},
         429: {"description": "Rate limit exceeded"},
+    },
+)
+
+app.include_router(
+    courses.router,
+    tags=["🎓 Courses & Question Bank"],
+    responses={
+        401: {"description": "Authentication required"},
+        403: {"description": "Access denied"},
+        404: {"description": "Course not found"},
     },
 )
 

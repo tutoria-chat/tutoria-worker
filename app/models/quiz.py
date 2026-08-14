@@ -1,8 +1,9 @@
 """
-Quiz Model - Pre-generated quiz questions for modules
+Quiz Model - Pre-generated quiz questions for courses
 
-Stores quiz questions generated once during module creation to eliminate
-on-demand generation costs and improve performance.
+Stores the course-wide question bank. Questions are generated from a module's
+materials (module_id records that origin) or uploaded straight to the course,
+and are always served to students at course scope.
 """
 from sqlalchemy import Column, Integer, String, ForeignKey, Text
 from sqlalchemy.orm import relationship
@@ -19,15 +20,19 @@ class QuizDifficulty(str, enum.Enum):
 
 class Quiz(BaseModel):
     """
-    Pre-generated quiz questions for modules.
+    Pre-generated quiz questions making up a course's question bank.
 
-    Each module should have ~50 questions generated once when created,
-    with detailed explanations for ALL answer options.
+    Generation still runs per module (~50 questions from that module's files),
+    but every question lands in the shared course bank.
     """
     __tablename__ = "Quizzes"
 
-    # Foreign key to module
-    module_id = Column("ModuleId", Integer, ForeignKey("Modules.Id", ondelete="CASCADE"), nullable=False, index=True)
+    # The question bank is course-wide: this is the scope every read filters on.
+    course_id = Column("CourseId", Integer, ForeignKey("Courses.Id", ondelete="CASCADE"), nullable=False, index=True)
+
+    # Provenance only — which module's material this question was generated from.
+    # NULL for questions uploaded straight to the course bank.
+    module_id = Column("ModuleId", Integer, ForeignKey("Modules.Id", ondelete="CASCADE"), nullable=True, index=True)
 
     # Question details
     question_number = Column("QuestionNumber", Integer, nullable=False)  # 1-50
@@ -59,15 +64,17 @@ class Quiz(BaseModel):
     concepts_covered = Column("ConceptsCovered", String(500), nullable=True)  # Comma-separated topics
 
     # Relationships
+    course = relationship("Course", back_populates="quizzes")
     module = relationship("Module", back_populates="quizzes")
 
     def __repr__(self):
-        return f"<Quiz(id={self.id}, module_id={self.module_id}, question_number={self.question_number}, difficulty={self.difficulty})>"
+        return f"<Quiz(id={self.id}, course_id={self.course_id}, question_number={self.question_number}, difficulty={self.difficulty})>"
 
     def to_dict(self):
         """Convert quiz to dictionary for API responses."""
         return {
             "id": self.id,
+            "course_id": self.course_id,
             "module_id": self.module_id,
             "question_number": self.question_number,
             "question_text": self.question_text,

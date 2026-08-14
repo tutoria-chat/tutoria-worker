@@ -13,7 +13,7 @@ from typing import List, Dict, Any, Optional
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.models import Module, Quiz, QuizDifficulty
+from app.models import Course, Quiz, QuizDifficulty
 from app.models.ai_model import AIModel
 
 logger = logging.getLogger(__name__)
@@ -22,8 +22,8 @@ logger = logging.getLogger(__name__)
 class QuizExtractorService:
     """Service for extracting quiz questions from uploaded files."""
 
-    def __init__(self, module: Module, db: Session):
-        self.module = module
+    def __init__(self, course: Course, db: Session):
+        self.course = course
         self.db = db
 
     async def extract_from_text(self, file_content: str, file_name: str) -> List[Dict[str, Any]]:
@@ -42,7 +42,10 @@ class QuizExtractorService:
         """
         logger.info(f"Extracting quiz questions from file: {file_name}")
 
-        tutor_language = self.module.tutor_language or "pt-br"
+        # Courses have no language of their own — follow the course's modules,
+        # which in practice all share one tutor language.
+        _module = next(iter(self.course.modules or []), None)
+        tutor_language = (getattr(_module, "tutor_language", None) or "pt-br")
 
         system_prompt = (
             "You are an expert at analyzing educational documents and extracting "
@@ -57,7 +60,7 @@ class QuizExtractorService:
         user_prompt = f"""Analyze the following document and extract ALL quiz/test questions found in it.
 
 Document: {file_name}
-Module: {self.module.name}
+Course: {self.course.name}
 Language: {tutor_language}
 
 CONTENT:
@@ -124,9 +127,9 @@ Extract ALL questions. If a question has 5 options, include option E. The correc
         Returns:
             List of saved Quiz objects
         """
-        # Get the next question number for this module
+        # Get the next question number for this course's bank
         max_num = self.db.query(Quiz.question_number).filter(
-            Quiz.module_id == self.module.id
+            Quiz.course_id == self.course.id
         ).order_by(Quiz.question_number.desc()).first()
         start_number = (max_num[0] + 1) if max_num else 1
 
@@ -138,7 +141,9 @@ Extract ALL questions. If a question has 5 options, include option E. The correc
                     difficulty_str = "medium"
 
                 quiz = Quiz(
-                    module_id=self.module.id,
+                    course_id=self.course.id,
+                    # Uploaded questions have no source module
+                    module_id=None,
                     question_number=start_number + i,
                     question_text=q_data["question"],
                     difficulty=QuizDifficulty(difficulty_str),
@@ -217,8 +222,10 @@ Extract ALL questions. If a question has 5 options, include option E. The correc
         """Call a specific AI provider for quiz extraction with higher token limit."""
         from types import SimpleNamespace
 
+        # The AI services only read ai_model/name off this object — a course
+        # stands in for a module perfectly well here.
         dummy_module = SimpleNamespace(
-            id=self.module.id, ai_model=None, ai_model_id=None, name=self.module.name
+            id=self.course.id, ai_model=None, ai_model_id=None, name=self.course.name
         )
 
         # Quiz extraction needs more tokens than regular chat (large JSON output)

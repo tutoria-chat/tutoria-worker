@@ -99,7 +99,10 @@ class QuizGeneratorService:
             logger.error(error_msg)
             raise ValueError(error_msg)
 
-        # Delete any existing ai_generated quizzes before regenerating
+        # Delete any existing ai_generated quizzes generated FROM THIS MODULE before
+        # regenerating. The bank is course-wide, so this must stay scoped by
+        # module_id (provenance) — never by course_id, or a regeneration would
+        # wipe every sibling module's questions too.
         deleted = (
             self.db.query(Quiz)
             .filter(Quiz.module_id == self.module.id, Quiz.source == "ai_generated")
@@ -119,11 +122,22 @@ class QuizGeneratorService:
         all_quizzes = []
         errors = []
 
+        # The bank is shared by every module in the course, so numbering has to
+        # continue from whatever is already there — otherwise two modules both
+        # generate a question #1 and quiz analytics can't tell them apart.
+        _max_num = (
+            self.db.query(Quiz.question_number)
+            .filter(Quiz.course_id == self.module.course_id)
+            .order_by(Quiz.question_number.desc())
+            .first()
+        )
+        base = (_max_num[0] if _max_num else 0)
+
         # Generate each difficulty level - continue on partial failures
         for difficulty, diff_count, start in [
-            (QuizDifficulty.EASY, easy_count, 1),
-            (QuizDifficulty.MEDIUM, medium_count, easy_count + 1),
-            (QuizDifficulty.HARD, hard_count, easy_count + medium_count + 1),
+            (QuizDifficulty.EASY, easy_count, base + 1),
+            (QuizDifficulty.MEDIUM, medium_count, base + easy_count + 1),
+            (QuizDifficulty.HARD, hard_count, base + easy_count + medium_count + 1),
         ]:
             try:
                 quizzes = await self._generate_questions_by_difficulty(
@@ -347,6 +361,9 @@ class QuizGeneratorService:
         for i, q_data in enumerate(questions_data[:count]):
             try:
                 quiz = Quiz(
+                    # The bank is course-wide; module_id records which module's
+                    # material these questions were generated from.
+                    course_id=self.module.course_id,
                     module_id=self.module.id,
                     question_number=start_number + i,
                     question_text=q_data["question"],

@@ -12,7 +12,8 @@ from .base import BaseModel
 class QuizUploadJob(BaseModel):
     __tablename__ = "QuizUploadJobs"
 
-    module_id = Column("ModuleId", Integer, ForeignKey("Modules.Id"), nullable=False)
+    # Uploaded question banks land in the course-wide bank.
+    course_id = Column("CourseId", Integer, ForeignKey("Courses.Id"), nullable=False)
     file_id = Column("FileId", Integer, ForeignKey("Files.Id"), nullable=True)
     status = Column("Status", String(50), nullable=False, default="pending")
     extracted_count = Column("ExtractedCount", Integer, default=0, nullable=False)
@@ -30,10 +31,10 @@ class QuizUploadJob(BaseModel):
     )
 
     # Relationships
-    module = relationship("Module")
+    course = relationship("Course")
 
     def __repr__(self):
         return (
-            f"<QuizUploadJob(id={self.id}, module_id={self.module_id}, "
+            f"<QuizUploadJob(id={self.id}, course_id={self.course_id}, "
             f"status={self.status}, extracted_count={self.extracted_count})>"
         )

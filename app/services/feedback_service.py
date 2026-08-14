@@ -147,6 +147,7 @@ async def process_feedback_job(
     submission_id: int,
     conversation_id: str,
     matricula: Optional[str] = None,
+    module_id: Optional[int] = None,
 ) -> None:
     """
     Generate feedback for a submission and store it on the row.
@@ -170,14 +171,23 @@ async def process_feedback_job(
     if not assignment:
         raise ValueError(f"Assignment {submission.assignment_id} not found for submission {submission_id}")
 
-    module = (
-        db.query(Module)
-        .options(joinedload(Module.ai_model))
-        .filter(Module.id == assignment.module_id)
-        .first()
-    )
+    # Assignments belong to the course, not a module — but feedback still needs a
+    # module for its AI model and system prompt. Use the module the student was in
+    # when they submitted (carried on the queue message); fall back to the course's
+    # first active module for messages enqueued before module_id was threaded through.
+    module_query = db.query(Module).options(joinedload(Module.ai_model))
+    module = module_query.filter(Module.id == module_id).first() if module_id else None
     if not module:
-        raise ValueError(f"Module {assignment.module_id} not found for submission {submission_id}")
+        module = (
+            module_query
+            .filter(Module.course_id == assignment.course_id, Module.is_active == True)
+            .order_by(Module.id)
+            .first()
+        )
+    if not module:
+        raise ValueError(
+            f"No module found for course {assignment.course_id} (submission {submission_id})"
+        )
 
     blob_storage = get_blob_storage()
 

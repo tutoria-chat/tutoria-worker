@@ -4,6 +4,7 @@ SQS Worker — listens for document extraction and quiz generation jobs.
 Message formats:
   Extraction queue: { "file_id": 123, "module_id": 456 }
   Quiz gen queue:   { "module_id": 789, "count": 50, "upsert": true }
+  Quiz upload queue:{ "job_id": 12, "course_id": 34 }
 
 Both queues are polled in separate async loops using long-polling (20s).
 A message is only deleted from SQS after successful processing; on error
@@ -156,18 +157,23 @@ async def _process_transcription_message(body: dict) -> None:
 
 
 async def _process_quiz_upload_message(body: dict) -> None:
-    """Extract quiz questions from an uploaded file and store in QuizUploadJob."""
+    """Extract quiz questions from an uploaded file and store in QuizUploadJob.
+
+    Uploaded questions go into the course-wide question bank, so the job is
+    scoped by course_id (it was module_id before assignments and the question
+    bank moved to course scope).
+    """
     job_id: Optional[int] = body.get("job_id")
-    module_id: Optional[int] = body.get("module_id")
+    course_id: Optional[int] = body.get("course_id")
 
     if not job_id:
         raise ValueError(f"Missing job_id in quiz-upload message: {body}")
-    if not module_id:
-        raise ValueError(f"Missing module_id in quiz-upload message: {body}")
+    if not course_id:
+        raise ValueError(f"Missing course_id in quiz-upload message: {body}")
 
     db = SessionLocal()
     try:
-        from app.models import QuizUploadJob, Module as ModuleModel
+        from app.models import QuizUploadJob, Course as CourseModel
         from app.services.quiz_extractor import extract_text_from_file, QuizExtractorService
         import json as _json
         import boto3
@@ -179,9 +185,9 @@ async def _process_quiz_upload_message(body: dict) -> None:
         if not job.input_s3_key:
             raise ValueError(f"QuizUploadJob {job_id} has no input_s3_key")
 
-        module = db.query(ModuleModel).filter(ModuleModel.id == module_id, ModuleModel.is_active == True).first()
-        if not module:
-            raise ValueError(f"Module {module_id} not found or inactive")
+        course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
+        if not course:
+            raise ValueError(f"Course {course_id} not found")
 
         # Mark processing
         from datetime import datetime, timezone
@@ -208,7 +214,7 @@ async def _process_quiz_upload_message(body: dict) -> None:
         if not text_content.strip():
             raise ValueError("Could not extract text from file. File may be empty or corrupted.")
 
-        extractor = QuizExtractorService(module, db)
+        extractor = QuizExtractorService(course, db)
         questions = await extractor.extract_from_text(text_content, filename)
 
         # Store extracted questions as JSON
@@ -218,8 +224,8 @@ async def _process_quiz_upload_message(body: dict) -> None:
         job.processed_at = datetime.now(timezone.utc)
         db.commit()
 
-        logger.info("✅ Quiz upload extraction complete — job_id=%s module_id=%s extracted=%s",
-                    job_id, module_id, len(questions))
+        logger.info("✅ Quiz upload extraction complete — job_id=%s course_id=%s extracted=%s",
+                    job_id, course_id, len(questions))
     except Exception as exc:
         from app.models import QuizUploadJob as _QUJ
         from datetime import datetime, timezone
@@ -242,6 +248,8 @@ async def _process_feedback_message(body: dict) -> None:
     """
     submission_id: Optional[int] = body.get("submission_id")
     conversation_id: Optional[str] = body.get("conversation_id")
+    # The module the student was in — assignments themselves are course-scoped now.
+    module_id: Optional[int] = body.get("module_id")
 
     if not submission_id:
         raise ValueError(f"Missing submission_id in feedback message: {body}")
@@ -258,6 +266,7 @@ async def _process_feedback_message(body: dict) -> None:
                 submission_id=submission_id,
                 conversation_id=conversation_id,
                 matricula=body.get("matricula"),
+                module_id=module_id,
             )
         except Exception:
             # Mark failed when this was the last delivery attempt — afterwards the

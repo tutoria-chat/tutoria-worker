@@ -6,7 +6,8 @@ from .base import BaseModel
 class Assignment(BaseModel):
     __tablename__ = "Assignments"
 
-    module_id = Column("ModuleId", Integer, ForeignKey("Modules.Id"), nullable=False)
+    # Assignments belong to the whole course, not a single module.
+    course_id = Column("CourseId", Integer, ForeignKey("Courses.Id"), nullable=False)
     title = Column("Title", String(255), nullable=False)
     description = Column("Description", Text)
     due_date = Column("DueDate", DateTime(timezone=True), nullable=False)
@@ -36,4 +37,5 @@ class Assignment(BaseModel):
 
     created_by_user_id = Column("CreatedByUserId", Integer, ForeignKey("Users.UserId"), nullable=False)
 
+    course = relationship("Course", back_populates="assignments")
     submissions = relationship("AssignmentSubmission", back_populates="assignment")

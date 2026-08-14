@@ -29,5 +29,7 @@ class Module(BaseModel):
 
     course = relationship("Course", back_populates="modules")
     files = relationship("File", back_populates="module", cascade="all, delete-orphan")
-    quizzes = relationship("Quiz", back_populates="module", cascade="all, delete-orphan")
+    # Questions generated from this module's material. The bank itself lives on
+    # the course — this is the provenance back-ref only, so no delete cascade.
+    quizzes = relationship("Quiz", back_populates="module")
     ai_model = relationship("AIModel", back_populates="modules")
