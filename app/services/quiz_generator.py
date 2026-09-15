@@ -13,6 +13,7 @@ as quiz extraction and file extraction services.
 """
 import logging
 import json
+import random
 from typing import List, Dict, Any, Optional
 from sqlalchemy.orm import Session
 
@@ -360,6 +361,10 @@ class QuizGeneratorService:
         parse_errors = 0
         for i, q_data in enumerate(questions_data[:count]):
             try:
+                # Randomize option order now, at creation, so the correct answer's
+                # position varies and the stored letters are final (the widget shows
+                # them as-is, never shuffling at display time).
+                q_data = self._randomize_option_order(q_data)
                 quiz = Quiz(
                     # The bank is course-wide; module_id records which module's
                     # material these questions were generated from.
@@ -406,6 +411,47 @@ class QuizGeneratorService:
 
         return quizzes
 
+    @staticmethod
+    def _randomize_option_order(q_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Randomize the letter order of a question's options at creation time so the
+        correct answer isn't always in the slot the model happened to pick (models
+        favour "A"). Each option's text stays paired with its own explanation; only
+        the A/B/C/D(/E) slots change, and ``correct_answer`` is remapped to the
+        correct option's new slot.
+
+        Because explanations are self-contained and never cite an option letter,
+        reordering here is safe — the widget shows options in this stored order and
+        never has to shuffle at display time (which used to leave the letter cited
+        in an explanation pointing at the wrong option).
+
+        Returns a new q_data dict; the input is left unchanged. If the data is
+        malformed (missing options or a correct_answer that isn't among them) the
+        original q_data is returned untouched so downstream parsing handles it.
+        """
+        letters = ["A", "B", "C", "D", "E"]
+        options = q_data.get("options")
+        correct = q_data.get("correct_answer")
+
+        if not isinstance(options, dict) or correct not in options:
+            return q_data
+
+        # Present options, in order, as (text, explanation) items — keep the pair together.
+        present = [l for l in letters if isinstance(options.get(l), dict) and options[l].get("text")]
+        if correct not in present or len(present) < 2:
+            return q_data
+
+        items = [options[l] for l in present]
+        correct_item = options[correct]
+
+        shuffled = items[:]
+        random.shuffle(shuffled)
+
+        new_options = {letters[i]: item for i, item in enumerate(shuffled)}
+        new_correct = next(letters[i] for i, item in enumerate(shuffled) if item is correct_item)
+
+        return {**q_data, "options": new_options, "correct_answer": new_correct}
+
     def _build_generation_prompt(self, difficulty: QuizDifficulty, count: int) -> str:
         """
         Build AI prompt for quiz generation.
@@ -443,6 +489,10 @@ REQUISITOS CRÍTICOS:
 2. EXPLICAÇÃO DETALHADA (2-4 frases) para TODAS as alternativas:
    - Por que a resposta CORRETA está certa (cite materiais do curso)
    - Por que as respostas ERRADAS estão erradas (erros conceituais comuns)
+   - AUTOCONTIDA: fale do CONTEÚDO da alternativa. NUNCA cite a letra ou a
+     posição dela (não escreva "a alternativa C", "a letra A", "a primeira
+     opção" etc.), pois as alternativas são embaralhadas antes de chegar ao
+     estudante e a letra citada não corresponderá mais.
 3. Perguntas claras e objetivas
 4. Nível {difficulty.value}: {"conceitos básicos" if difficulty == QuizDifficulty.EASY else "aplicação prática" if difficulty == QuizDifficulty.MEDIUM else "análise crítica e síntese"}
 5. NÃO mencione nomes de arquivos, documentos ou slides nas perguntas — foque no conteúdo
@@ -452,7 +502,7 @@ Responda com JSON no formato:
   {{
     "question": "Texto da pergunta?",
     "options": {{
-      "A": {{"text": "Alternativa A", "explanation": "Explicação detalhada de por que A está correta/errada"}},
+      "A": {{"text": "Alternativa A", "explanation": "Explicação detalhada, sem citar a letra, de por que esta alternativa está correta/errada"}},
       "B": {{"text": "Alternativa B", "explanation": "Explicação detalhada..."}},
       "C": {{"text": "Alternativa C", "explanation": "Explicação detalhada..."}},
       "D": {{"text": "Alternativa D", "explanation": "Explicação detalhada..."}}
@@ -473,6 +523,10 @@ CRITICAL REQUIREMENTS:
 2. DETAILED EXPLANATION (2-4 sentences) for ALL options:
    - Why the CORRECT answer is right (cite course materials)
    - Why the WRONG answers are wrong (common conceptual errors)
+   - SELF-CONTAINED: talk about the option's CONTENT. NEVER cite its letter or
+     position (do not write "option C", "letter A", "the first option", etc.),
+     because the options are shuffled before reaching the student and the cited
+     letter will no longer match.
 3. Clear and objective questions
 4. {difficulty.value} level: {"basic concepts" if difficulty == QuizDifficulty.EASY else "practical application" if difficulty == QuizDifficulty.MEDIUM else "critical analysis and synthesis"}
 5. Do NOT mention file names, document names, or slide numbers in questions — focus on content only
@@ -482,7 +536,7 @@ Respond with JSON in the format:
   {{
     "question": "Question text?",
     "options": {{
-      "A": {{"text": "Option A", "explanation": "Detailed explanation of why A is correct/incorrect"}},
+      "A": {{"text": "Option A", "explanation": "Detailed explanation, without citing the letter, of why this option is correct/incorrect"}},
       "B": {{"text": "Option B", "explanation": "Detailed explanation..."}},
       "C": {{"text": "Option C", "explanation": "Detailed explanation..."}},
       "D": {{"text": "Option D", "explanation": "Detailed explanation..."}}
@@ -503,6 +557,10 @@ REQUISITOS CRÍTICOS:
 2. EXPLICACIÓN DETALLADA (2-4 frases) para TODAS las opciones:
    - Por qué la respuesta CORRECTA es correcta (cita materiales del curso)
    - Por qué las respuestas INCORRECTAS son incorrectas (errores conceptuales comunes)
+   - AUTOCONTENIDA: habla del CONTENIDO de la opción. NUNCA cites su letra ni su
+     posición (no escribas "la opción C", "la letra A", "la primera opción",
+     etc.), porque las opciones se barajan antes de llegar al estudiante y la
+     letra citada ya no coincidirá.
 3. Preguntas claras y objetivas
 4. Nivel {difficulty.value}: {"conceptos básicos" if difficulty == QuizDifficulty.EASY else "aplicación práctica" if difficulty == QuizDifficulty.MEDIUM else "análisis crítico y síntesis"}
 5. NO menciones nombres de archivos, documentos o diapositivas en las preguntas — enfócate en el contenido
@@ -512,7 +570,7 @@ Responde con JSON en el formato:
   {{
     "question": "Texto de la pregunta?",
     "options": {{
-      "A": {{"text": "Opción A", "explanation": "Explicación detallada de por qué A es correcta/incorrecta"}},
+      "A": {{"text": "Opción A", "explanation": "Explicación detallada, sin citar la letra, de por qué esta opción es correcta/incorrecta"}},
       "B": {{"text": "Opción B", "explanation": "Explicación detallada..."}},
       "C": {{"text": "Opción C", "explanation": "Explicación detallada..."}},
       "D": {{"text": "Opción D", "explanation": "Explicación detallada..."}}
