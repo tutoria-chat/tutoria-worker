@@ -1,10 +1,11 @@
 """
 Correction-assistant service — AI-powered batch FORMATIVE FEEDBACK on written
 answers. It never assigns or suggests a grade (CNE Guidelines for AI in
-Education): the "nota" column is always empty and the teacher assigns the grade.
+Education): the CSV carries NO grade column at all — the teacher assigns the
+grade in Moodle.
 
 Input  : JSON file uploaded to S3 (Moodle-compatible format)
-Output : CSV  → S3  (matricula,email,cmid,slot,nota,comentario,max_mark,name,question_text,answer)
+Output : CSV  → S3  (matricula,email,cmid,slot,comentario,max_mark,name,question_text,answer)
 
 Flow:
   1. Load GradingJob from DB, set status → processing
@@ -12,7 +13,7 @@ Flow:
   3. Parse JSON with field normalizer (handles snake/camel/Pascal)
   4. Load course context: all modules → all active files → extracted text
   5. For each student: batch-grade all non-empty answers in ONE AI call
-     - Empty answers → nota="" , comentario="Resposta não fornecida" (no AI call)
+     - Empty answers → comentario="Resposta não fornecida" (no AI call)
   6. Build CSV and upload to S3
   7. Update DB: status=completed or failed
 """
@@ -567,7 +568,6 @@ class GradingService:
                         "email": email,
                         "cmid": q_cmid,
                         "slot": str(q.get("slot", "")),
-                        "nota": "",
                         "comentario": _sanitize_comment(f"Erro ao processar: {str(exc)[:200]}"),
                         "max_mark": str(q.get("max_mark", "") or ""),
                         "name": sub_name,
@@ -594,15 +594,19 @@ class GradingService:
         job.updated_at = datetime.now(timezone.utc)
         self.db.commit()
 
+        # Audit trail: state plainly that the AI produced formative feedback only
+        # and no grade (the teacher assigns grades in Moodle — CNE Guidelines).
         logger.info(
-            "✅ Grading job %s completed — %d submissions, %d CSV rows",
+            "✅ Grading job %s completed — %d submissions, %d CSV rows "
+            "(formative feedback only, no grade produced by the AI)",
             job.id, processed, len(csv_rows),
         )
 
     async def _grade_submission(self, submission: dict, course_context: str, grading_criteria: Optional[str] = None) -> list[dict]:
         """
-        Grade all questions for one student. Returns list of CSV-row dicts.
-        Empty answers get 0 without an AI call.
+        Produce formative feedback for all questions of one student. Returns a
+        list of CSV-row dicts (no grade column — the teacher assigns the grade).
+        Empty answers get a "Resposta não fornecida" note without an AI call.
         All non-empty answers are batched into a single AI call per student.
         """
         # Accept several common field names for student identifier
@@ -638,7 +642,6 @@ class GradingService:
                     "email": email,
                     "cmid": cmid,
                     "slot": slot,
-                    "nota": "",
                     "comentario": "Resposta não fornecida",
                     "max_mark": max_mark,
                     "name": name,
@@ -673,7 +676,7 @@ class GradingService:
                 "email": email,
                 "cmid": orig_q.get("cmid", submission_cmid),
                 "slot": str(result["slot"]),
-                "nota": "",  # Compliance: the teacher assigns the grade; the AI never suggests one.
+                # Compliance: no grade column — the teacher assigns the grade; the AI never suggests one.
                 "comentario": _sanitize_comment(result["comment"]),
                 "max_mark": orig_q.get("max_mark", ""),
                 "name": name,
@@ -779,7 +782,10 @@ class GradingService:
 def _build_csv(rows: list[dict]) -> bytes:
     """
     Serialize rows to UTF-8-with-BOM CSV bytes.
-    Header: matricula,email,cmid,slot,nota,comentario,max_mark,name,question_text,answer
+    Header: matricula,email,cmid,slot,comentario,max_mark,name,question_text,answer
+
+    There is no grade column — the AI never suggests a grade (CNE Guidelines);
+    the teacher assigns it in Moodle.
 
     - UTF-8 BOM (﻿) ensures Excel on Windows (Portuguese locale) opens correctly.
     - QUOTE_ALL ensures every field is quoted, preventing any in-field comma from
@@ -788,7 +794,7 @@ def _build_csv(rows: list[dict]) -> bytes:
     output = io.StringIO()
     writer = csv.DictWriter(
         output,
-        fieldnames=["matricula", "email", "cmid", "slot", "nota", "comentario", "max_mark", "name", "question_text", "answer"],
+        fieldnames=["matricula", "email", "cmid", "slot", "comentario", "max_mark", "name", "question_text", "answer"],
         extrasaction="ignore",
         lineterminator="\r\n",   # Windows-style line endings for Excel compatibility
         quoting=csv.QUOTE_ALL,
