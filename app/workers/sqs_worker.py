@@ -26,6 +26,19 @@ from app.services.quiz_generator import QuizGeneratorService
 
 logger = logging.getLogger(__name__)
 
+# Message fields that must never reach the logs: the student's opted-in answer
+# style (see app/prompts/learning_adaptations.py) — only a count is logged.
+_UNLOGGED_KEYS = ("learning_adaptations", "learning_note")
+
+
+def _loggable(body: dict) -> dict:
+    """A copy of a queue message that's safe to log (learning prefs redacted)."""
+    if not isinstance(body, dict) or not any(k in body for k in _UNLOGGED_KEYS):
+        return body
+    safe = {k: v for k, v in body.items() if k not in _UNLOGGED_KEYS}
+    safe["learning_prefs"] = "<redacted>"
+    return safe
+
 
 def _get_sqs_client():
     return boto3.client(
@@ -244,7 +257,9 @@ async def _process_feedback_message(body: dict) -> None:
     """
     Generate AI feedback for a student's assignment submission (companion widget).
     Message: { "submission_id": 1, "assignment_id": 2, "module_id": 3,
-               "conversation_id": "uuid", "student_id": 42, "matricula": "MAT123" }
+               "conversation_id": "uuid", "student_id": 42, "matricula": "MAT123",
+               "learning_adaptations": ["steps", ...], "learning_note": "..." }
+    The last two are optional (student opt-in answer style) and never logged.
     """
     submission_id: Optional[int] = body.get("submission_id")
     conversation_id: Optional[str] = body.get("conversation_id")
@@ -252,9 +267,9 @@ async def _process_feedback_message(body: dict) -> None:
     module_id: Optional[int] = body.get("module_id")
 
     if not submission_id:
-        raise ValueError(f"Missing submission_id in feedback message: {body}")
+        raise ValueError(f"Missing submission_id in feedback message: {_loggable(body)}")
     if not conversation_id:
-        raise ValueError(f"Missing conversation_id in feedback message: {body}")
+        raise ValueError(f"Missing conversation_id in feedback message: {_loggable(body)}")
 
     db = SessionLocal()
     try:
@@ -267,6 +282,8 @@ async def _process_feedback_message(body: dict) -> None:
                 conversation_id=conversation_id,
                 matricula=body.get("matricula"),
                 module_id=module_id,
+                learning_adaptations=body.get("learning_adaptations"),
+                learning_note=body.get("learning_note"),
             )
         except Exception:
             # Mark failed when this was the last delivery attempt — afterwards the
@@ -340,7 +357,7 @@ async def _poll_queue(queue_url: str, queue_name: str, handler) -> None:
 
             try:
                 body = json.loads(msg["Body"])
-                logger.info("📨 Received %s message (attempt %s): %s", queue_name, receive_count, body)
+                logger.info("📨 Received %s message (attempt %s): %s", queue_name, receive_count, _loggable(body))
 
                 # Let handlers know which delivery attempt this is (e.g. to mark
                 # a job failed on the final attempt before the DLQ swallows it)

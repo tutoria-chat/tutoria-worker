@@ -14,7 +14,7 @@ import logging
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import List, Optional
 
 from sqlalchemy.orm import Session, joinedload
 
@@ -83,6 +83,7 @@ def _build_feedback_prompt(
     assignment_text: str,
     submission_text: str,
     rubric_section: str,
+    learning_block: str = "",
 ) -> str:
     tutor_language = module.tutor_language or "pt-br"
     language_instruction = LANGUAGE_INSTRUCTIONS.get(tutor_language, LANGUAGE_INSTRUCTIONS["pt-br"])
@@ -108,7 +109,9 @@ Provide structured feedback: strengths, areas for improvement, and specific sugg
 Be constructive and specific. Do NOT assign a numerical grade.
 --- END ASSIGNMENT CONTEXT ---"""
 
-    parts = [p for p in [language_instruction, module.system_prompt, assignment_context] if p]
+    # The student's opted-in answer style goes last (after the long assignment
+    # context) so it isn't lost in the middle. Never persisted.
+    parts = [p for p in [language_instruction, module.system_prompt, assignment_context, learning_block] if p]
     return "\n\n".join(parts)
 
 
@@ -148,9 +151,14 @@ async def process_feedback_job(
     conversation_id: str,
     matricula: Optional[str] = None,
     module_id: Optional[int] = None,
+    learning_adaptations: Optional[List[str]] = None,
+    learning_note: Optional[str] = None,
 ) -> None:
     """
     Generate feedback for a submission and store it on the row.
+    `learning_adaptations` / `learning_note` are the student's opted-in answer
+    style (whitelisted style ids — never a condition). They only shape this
+    prompt; nothing about them is stored on the row or logged.
     Raises on transient errors (SQS will redeliver); marks the row "failed"
     and swallows permanent generation errors after the final retry is up to SQS/DLQ.
     """
@@ -227,7 +235,13 @@ async def process_feedback_job(
         except Exception as e:
             logger.warning(f"Failed to extract rubric text: {e}")
 
-    system_prompt = _build_feedback_prompt(assignment, module, assignment_text, submission_text, rubric_section)
+    from app.prompts.learning_adaptations import build_learning_adaptations_block
+    learning_block = build_learning_adaptations_block(
+        learning_adaptations, learning_note, module.tutor_language or "pt-br"
+    )
+    system_prompt = _build_feedback_prompt(
+        assignment, module, assignment_text, submission_text, rubric_section, learning_block
+    )
     feedback_request_msg = f"Quero feedback sobre meu trabalho na atividade: **{assignment.title}**"
 
     ai_response = await _call_feedback_ai(module, system_prompt, feedback_request_msg, db)
