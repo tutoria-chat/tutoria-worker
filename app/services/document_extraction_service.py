@@ -65,6 +65,16 @@ except ImportError:
     PPTX_AVAILABLE = False
     logger.warning("python-pptx not available - PPTX extraction will use AI fallback")
 
+try:
+    from docx import Document as DocxDocument
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
+    logger.warning("python-docx not available - DOCX extraction disabled")
+
+IMAGE_TYPES = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp",
+               "heic": "image/heic", "heif": "image/heif"}
+
 
 class DocumentExtractionService:
     """Service for extracting text from documents and storing in database."""
@@ -77,6 +87,21 @@ class DocumentExtractionService:
     # ------------------------------------------------------------------
 
     async def extract_and_store(
+        self,
+        file: File,
+        force: bool = False,
+        use_openai: bool = False
+    ) -> bool:
+        """Extract (see _extract_and_store), then tell a TutorIA Estudantes student
+        their upload is ready/failed (no-op for institutional files)."""
+        already_done = file.processing_status == 'ready' and not force
+        ok = await self._extract_and_store(file, force=force, use_openai=use_openai)
+        if not already_done:
+            from app.services.student_push import notify_file_processed
+            await notify_file_processed(self.db, file, ok)
+        return ok
+
+    async def _extract_and_store(
         self,
         file: File,
         force: bool = False,
@@ -121,10 +146,23 @@ class DocumentExtractionService:
 
                 is_pdf = self._is_pdf(file)
                 is_pptx = self._is_pptx(file)
+                image_mime = self._image_mime(file)
                 extracted_text = None
                 loop = asyncio.get_event_loop()
 
-                if is_pdf:
+                if image_mime:
+                    # Photos (notebook pages, slides, book pages): Gemini reads them directly.
+                    extracted_text = await self._extract_pdf_with_gemini_vision(file_bytes, file, mime_type=image_mime)
+                    if not extracted_text:
+                        logger.warning(f"Image {file.id}: vision extraction returned nothing")
+                        file.processing_status = "failed"
+                        self.db.commit()
+                        return False
+
+                elif self._is_docx(file):
+                    extracted_text = await loop.run_in_executor(None, self._extract_docx, file_bytes, file)
+
+                elif is_pdf:
                     # Step 1a: peek at page resources — fast, no text extraction
                     has_images = await loop.run_in_executor(
                         None, self._has_pdf_images, file_bytes
@@ -477,6 +515,44 @@ Document:
             or (file.file_name and file.file_name.lower().endswith(('.pptx', '.ppt')))
         )
 
+    def _image_mime(self, file: File) -> Optional[str]:
+        """MIME type when the file is a photo/image, else None."""
+        ext = (file.file_type or "").lower().lstrip(".")
+        if ext in IMAGE_TYPES:
+            return IMAGE_TYPES[ext]
+        name = (file.file_name or "").lower()
+        for e, mime in IMAGE_TYPES.items():
+            if name.endswith("." + e):
+                return mime
+        ct = (file.content_type or "").lower()
+        return ct if ct in IMAGE_TYPES.values() else None
+
+    def _is_docx(self, file: File) -> bool:
+        docx_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        return (
+            (file.file_type or "").lower() == "docx"
+            or (file.content_type or "").lower() == docx_type
+            or (file.file_name or "").lower().endswith(".docx")
+        )
+
+    def _extract_docx(self, docx_bytes: bytes, file: File) -> Optional[str]:
+        """Extract paragraphs and tables from a Word file using python-docx."""
+        if not DOCX_AVAILABLE:
+            return None
+        try:
+            doc = DocxDocument(io.BytesIO(docx_bytes))
+            parts = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+            for table in doc.tables:
+                for row in table.rows:
+                    cells = [c.text.strip() for c in row.cells]
+                    if any(cells):
+                        parts.append(" | ".join(cells))
+            text = "\n".join(parts)
+            return text if text.strip() else None
+        except Exception as e:
+            logger.warning(f"python-docx extraction failed for file {file.id}: {e}")
+            return None
+
     def _extract_pptx(self, pptx_bytes: bytes, file: File) -> Optional[str]:
         """Extract text from a PowerPoint file using python-pptx."""
         if not PPTX_AVAILABLE:
@@ -613,7 +689,9 @@ Document:
             logger.warning(f"Could not scan PDF for images: {e} — assuming images present")
             return True
 
-    async def _extract_pdf_with_gemini_vision(self, pdf_bytes: bytes, file: File) -> Optional[str]:
+    async def _extract_pdf_with_gemini_vision(
+        self, pdf_bytes: bytes, file: File, mime_type: str = "application/pdf"
+    ) -> Optional[str]:
         """
         Send the raw PDF bytes to Gemini via the native REST API so it can extract
         both text AND visual content (images, diagrams, charts, scanned pages).
@@ -658,14 +736,18 @@ Document:
                 "parts": [
                     {
                         "inline_data": {
-                            "mime_type": "application/pdf",
+                            "mime_type": mime_type,
                             "data": base64.b64encode(pdf_bytes).decode(),
                         }
                     },
                     {
                         "text": (
-                            f'Extract all content from this PDF document named "{file_name}".\n\n'
-                            "Instructions:\n"
+                            (f'Extract all content from this PDF document named "{file_name}".\n\n'
+                             if mime_type == "application/pdf" else
+                             f'Extract all study content from this photo named "{file_name}" '
+                             '(notebook page, whiteboard, slide or book page). Keep the original language. '
+                             'Write formulas with plain symbols, no LaTeX.\n\n')
+                            + "Instructions:\n"
                             "- Extract ALL text, including text inside images, diagrams, and charts\n"
                             "- Preserve document structure (headings, paragraphs, lists)\n"
                             "- Format tables as markdown tables\n"

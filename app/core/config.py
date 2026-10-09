@@ -82,6 +82,10 @@ class Settings(BaseSettings):
     TOPIC_CLASSIFICATION_FALLBACK_CHAIN: str = "gemini,deepseek"
     TTL_BACKFILL_ENABLED: bool = False
 
+    # TutorIA Estudantes (B2C app): Expo push when a student's upload is processed
+    STUDENT_APP_PUSH_ENABLED: bool = True
+    STUDENT_APP_EXPO_ACCESS_TOKEN: Optional[str] = None
+
     # Application
     debug: bool = False
 
