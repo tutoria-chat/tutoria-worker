@@ -22,6 +22,9 @@ class University(BaseModel):
     max_courses = Column("MaxCourses", Integer, nullable=True)
     max_modules = Column("MaxModules", Integer, nullable=True)
     max_students = Column("MaxStudents", Integer, nullable=True)
+    # Grading assistant mode (owned by TutoriaApi): score is only valid for corporate.
+    institution_type = Column("InstitutionType", String(20), nullable=False, default="university")
+    grading_mode = Column("GradingMode", String(20), nullable=False, default="feedback")
 
     __table_args__ = (
         CheckConstraint("SubscriptionTier BETWEEN 1 AND 3", name="CK_Universities_SubscriptionTier"),

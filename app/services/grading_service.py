@@ -1,11 +1,21 @@
 """
-Correction-assistant service — AI-powered batch FORMATIVE FEEDBACK on written
-answers. It never assigns or suggests a grade (CNE Guidelines for AI in
-Education): the CSV carries NO grade column at all — the teacher assigns the
-grade in Moodle.
+Correction-assistant service — AI-powered batch feedback on written answers.
+
+Two modes, chosen per job (GradingJob.GradingMode, snapshotted by TutoriaApi):
+
+  feedback (default, and the ONLY mode for MEC/CNE institutions) — formative
+      feedback drafts only. The AI never assigns or suggests a grade (CNE
+      Guidelines for AI in Education): the CSV has NO grade column at all; the
+      teacher assigns the grade in Moodle.
+  score (corporate training only, see grading_scoring.py) — the AI also maps each
+      answer to rubric criteria; this code adds the points into a suggested grade,
+      with confidence, review reasons and per-criterion evidence. A person confirms.
+      Re-checked against the university at processing time.
 
 Input  : JSON file uploaded to S3 (Moodle-compatible format)
-Output : CSV  → S3  (matricula,email,cmid,slot,comentario,max_mark,name,question_text,answer)
+Output : CSV  → S3
+  feedback: matricula,email,cmid,slot,attemptid,comentario,max_mark,name,question_text,answer
+  score   : the same + nota,confianca,revisar,justificativa
 
 Flow:
   1. Load GradingJob from DB, set status → processing
@@ -36,6 +46,7 @@ from app.core.config import settings
 from app.models import Module, File
 from app.models.ai_model import AIModel
 from app.models.grading_job import GradingJob
+from app.services import grading_scoring as scoring
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +150,13 @@ def _get_gabarito(q: dict) -> str:
         or q.get("gabarito")
         or ""
     ).strip()
+    return _strip_html(raw) if raw else ""
+
+
+def _get_rubric(q: dict) -> str:
+    """The question's rubric for score mode: Moodle's "Informações para avaliadores"
+    (grader info) on essay questions, sent by the plugin as grader_info."""
+    raw = str(q.get("grader_info") or q.get("graderinfo") or q.get("rubric") or "").strip()
     return _strip_html(raw) if raw else ""
 
 
@@ -350,7 +368,14 @@ async def _call_provider(
 
 
 async def _call_ai(system_prompt: str, user_prompt: str, db: Session, images: Optional[list[str]] = None) -> str:
-    """Try each provider in the chain; raise if all fail."""
+    """Try each provider in the chain; raise if all fail. (Also used by ai_summary_worker.)"""
+    text, _model = await _call_ai_with_model(system_prompt, user_prompt, db, images)
+    return text
+
+
+async def _call_ai_with_model(system_prompt: str, user_prompt: str, db: Session,
+                              images: Optional[list[str]] = None) -> tuple:
+    """Like _call_ai, but also returns which model answered: (text, "provider:model")."""
     chain = _get_provider_chain(db)
     last_error = None
     for entry in chain:
@@ -359,7 +384,7 @@ async def _call_ai(system_prompt: str, user_prompt: str, db: Session, images: Op
                 entry["provider"], entry.get("model"), system_prompt, user_prompt, db, images
             )
             if result:
-                return result
+                return result, f"{entry['provider']}:{entry.get('model') or 'default'}"
         except Exception as exc:
             last_error = exc
             logger.warning("Grading: provider %s failed: %s", entry["provider"], exc)
@@ -534,14 +559,22 @@ class GradingService:
         course_context = await _build_course_context(course_id, self.db)
         logger.info("Course context: %d chars", len(course_context))
 
-        # 3. Grade each student (pass grading_criteria from job)
+        # 3. Which mode? Score only when the job AND the university (re-read now)
+        #    both allow it — a university under MEC/CNE always gets feedback only.
+        score_mode = self._score_mode_allowed(job, course_id)
+        self._models_used = set()
+        job.prompt_version = scoring.SCORE_PROMPT_VERSION if score_mode else scoring.FEEDBACK_PROMPT_VERSION
+        self.db.commit()
+        logger.info("Grading job %s mode: %s", job.id, "score" if score_mode else "feedback")
+
+        # 4. Grade each student (pass grading_criteria from job)
         grading_criteria: Optional[str] = getattr(job, "grading_criteria", None)
         csv_rows: list[dict] = []
         processed = 0
 
         for submission in submissions:
             try:
-                rows = await self._grade_submission(submission, course_context, grading_criteria)
+                rows = await self._grade_submission(submission, course_context, grading_criteria, score_mode)
                 csv_rows.extend(rows)
                 processed += 1
                 job.processed_submissions = processed
@@ -563,46 +596,77 @@ class GradingService:
                 sub_name = str(submission.get("name", ""))
                 for q in submission.get("questions", []):
                     q_cmid = sub_cmid or str(q.get("quiz_cmid") or q.get("cmid") or "")
-                    csv_rows.append({
+                    row = {
                         "matricula": matricula,
                         "email": email,
                         "cmid": q_cmid,
                         "slot": str(q.get("slot", "")),
+                        "attemptid": str(q.get("attemptid") or ""),
                         "comentario": _sanitize_comment(f"Erro ao processar: {str(exc)[:200]}"),
                         "max_mark": str(q.get("max_mark", "") or ""),
                         "name": sub_name,
                         "question_text": _get_question_text(q),
                         "answer": _get_answer(q),
-                    })
+                    }
+                    if score_mode:
+                        row.update({"nota": "", "confianca": "baixa",
+                                    "revisar": scoring.REVIEW_ERROR, "justificativa": ""})
+                    csv_rows.append(row)
                 processed += 1
                 job.processed_submissions = processed
                 self.db.commit()
 
-        # 4. Build and upload CSV — filename: COURSENAME_DATEUTC_JOBID.csv
+        # 5. Build and upload CSV — filename: COURSENAME_DATEUTC_JOBID.csv
         course_slug = _slugify(self._get_course_name(course_id))
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         result_filename = f"{course_slug}_{date_str}_{job.id}.csv"
         result_key = f"grading-jobs/{course_id}/{job.id}/{result_filename}"
-        csv_bytes = _build_csv(csv_rows)
+        csv_bytes = _build_csv(csv_rows, score_mode=score_mode)
         logger.info("Uploading result CSV (%d bytes) to %s", len(csv_bytes), result_key)
         await _upload_s3_csv(result_key, csv_bytes)
 
-        # 5. Mark completed
+        # 6. Mark completed (+ audit: which model(s) produced this result)
         job.status = "completed"
         job.result_s3_key = result_key
+        job.model_used = (", ".join(sorted(self._models_used)) or None) if self._models_used else None
+        if job.model_used and len(job.model_used) > 200:
+            job.model_used = job.model_used[:200]
         job.processed_at = datetime.now(timezone.utc)
         job.updated_at = datetime.now(timezone.utc)
         self.db.commit()
 
-        # Audit trail: state plainly that the AI produced formative feedback only
-        # and no grade (the teacher assigns grades in Moodle — CNE Guidelines).
+        # Audit trail: state plainly which mode ran. In feedback mode the AI produced
+        # formative feedback only and no grade (the teacher assigns grades — CNE).
         logger.info(
-            "✅ Grading job %s completed — %d submissions, %d CSV rows "
-            "(formative feedback only, no grade produced by the AI)",
+            "✅ Grading job %s completed — %d submissions, %d CSV rows (%s, prompt %s, model %s)",
             job.id, processed, len(csv_rows),
+            "suggested grades for human confirmation — corporate score mode" if score_mode
+            else "formative feedback only, no grade produced by the AI",
+            job.prompt_version, job.model_used,
         )
 
-    async def _grade_submission(self, submission: dict, course_context: str, grading_criteria: Optional[str] = None) -> list[dict]:
+    def _score_mode_allowed(self, job: GradingJob, course_id: int) -> bool:
+        """Re-check the university now: the job snapshot alone is not enough."""
+        if getattr(job, "grading_mode", "feedback") != scoring.GRADING_MODE_SCORE:
+            return False
+        from app.models import Course, University
+        course = self.db.query(Course).filter(Course.id == course_id).first()
+        university = (
+            self.db.query(University).filter(University.id == course.university_id).first()
+            if course else None
+        )
+        allowed = university is not None and scoring.score_mode_allowed(
+            job.grading_mode, university.institution_type, university.grading_mode
+        )
+        if not allowed:
+            logger.warning(
+                "Grading job %s asked for score mode but the university no longer allows it — "
+                "running feedback only", job.id,
+            )
+        return allowed
+
+    async def _grade_submission(self, submission: dict, course_context: str, grading_criteria: Optional[str] = None,
+                                score_mode: bool = False) -> list[dict]:
         """
         Produce formative feedback for all questions of one student. Returns a
         list of CSV-row dicts (no grade column — the teacher assigns the grade).
@@ -637,17 +701,23 @@ class GradingService:
 
             if not answer:
                 # Empty answer — no AI needed
-                rows.append({
+                row = {
                     "matricula": matricula,
                     "email": email,
                     "cmid": cmid,
                     "slot": slot,
+                    "attemptid": str(q.get("attemptid") or ""),
                     "comentario": "Resposta não fornecida",
                     "max_mark": max_mark,
                     "name": name,
                     "question_text": question_text,
                     "answer": answer,
-                })
+                }
+                if score_mode:
+                    # Nothing to assess: 0, flagged so a person still sees it.
+                    row.update({"nota": "0", "confianca": "alta",
+                                "revisar": scoring.REVIEW_EMPTY, "justificativa": ""})
+                rows.append(row)
             else:
                 ai_questions.append({
                     "slot": q.get("slot"),
@@ -655,7 +725,9 @@ class GradingService:
                     "answer": answer,
                     "max_mark": max_mark,
                     "cmid": cmid,
+                    "attemptid": str(q.get("attemptid") or ""),
                     "gabarito": _get_gabarito(q),
+                    "rubric": _get_rubric(q) if score_mode else "",
                     "images": _get_question_images(q),
                 })
 
@@ -663,7 +735,10 @@ class GradingService:
             return rows
 
         # Single AI call for all non-empty answers of this student
-        graded = await self._call_ai_for_student(ai_questions, course_context, grading_criteria)
+        if score_mode:
+            graded = await self._score_student(ai_questions, course_context, grading_criteria)
+        else:
+            graded = await self._call_ai_for_student(ai_questions, course_context, grading_criteria)
 
         for result in graded:
             # Retrieve the original question data for this slot
@@ -671,18 +746,27 @@ class GradingService:
                 (q for q in ai_questions if str(q["slot"]) == str(result["slot"])),
                 {},
             )
-            rows.append({
+            row = {
                 "matricula": matricula,
                 "email": email,
                 "cmid": orig_q.get("cmid", submission_cmid),
                 "slot": str(result["slot"]),
-                # Compliance: no grade column — the teacher assigns the grade; the AI never suggests one.
+                "attemptid": orig_q.get("attemptid", ""),
+                # Feedback mode: no grade column — the teacher assigns the grade; the AI never suggests one.
                 "comentario": _sanitize_comment(result["comment"]),
                 "max_mark": orig_q.get("max_mark", ""),
                 "name": name,
                 "question_text": orig_q.get("question_text", ""),
                 "answer": orig_q.get("answer", ""),
-            })
+            }
+            if score_mode:
+                row.update({
+                    "nota": result.get("nota", ""),
+                    "confianca": result.get("confianca", "baixa"),
+                    "revisar": ";".join(result.get("revisar") or []),
+                    "justificativa": _sanitize_comment(result.get("justificativa", "")) if result.get("justificativa") else "",
+                })
+            rows.append(row)
 
         return rows
 
@@ -771,21 +855,50 @@ class GradingService:
             "One entry per question. No other text."
         )
 
-        response_text = await _call_ai(system_prompt, user_prompt, self.db, images=all_images or None)
+        response_text, model_label = await _call_ai_with_model(system_prompt, user_prompt, self.db, images=all_images or None)
+        self._note_model(model_label)
         return _parse_grading_response(response_text, questions)
+
+    async def _score_student(
+        self, questions: list[dict], course_context: str, grading_criteria: Optional[str] = None
+    ) -> list[dict]:
+        """Score mode (corporate only): rubric points per criterion → suggested grade."""
+        all_images: list[str] = []
+        for q in questions:
+            all_images.extend(q.get("images") or [])
+        user_prompt = scoring.build_score_user_prompt(
+            questions, course_context, grading_criteria, len(all_images)
+        )
+        response_text, model_label = await _call_ai_with_model(
+            scoring.SCORE_SYSTEM_PROMPT, user_prompt, self.db, images=all_images or None
+        )
+        self._note_model(model_label)
+        return scoring.parse_score_response(response_text, questions)
+
+    def _note_model(self, label: Optional[str]) -> None:
+        if not hasattr(self, "_models_used"):
+            self._models_used = set()
+        if label:
+            self._models_used.add(label)
 
 
 # ---------------------------------------------------------------------------
 # CSV builder
 # ---------------------------------------------------------------------------
 
-def _build_csv(rows: list[dict]) -> bytes:
+FEEDBACK_CSV_FIELDS = ["matricula", "email", "cmid", "slot", "attemptid", "comentario",
+                       "max_mark", "name", "question_text", "answer"]
+SCORE_CSV_FIELDS = FEEDBACK_CSV_FIELDS + ["nota", "confianca", "revisar", "justificativa"]
+
+
+def _build_csv(rows: list[dict], score_mode: bool = False) -> bytes:
     """
     Serialize rows to UTF-8-with-BOM CSV bytes.
-    Header: matricula,email,cmid,slot,comentario,max_mark,name,question_text,answer
 
-    There is no grade column — the AI never suggests a grade (CNE Guidelines);
-    the teacher assigns it in Moodle.
+    Feedback mode has NO grade column — the AI never suggests a grade (CNE
+    Guidelines); the teacher assigns it in Moodle. Only score mode (corporate
+    training) adds nota/confianca/revisar/justificativa. Consumers read columns
+    by header name, so the extra columns are safe.
 
     - UTF-8 BOM (﻿) ensures Excel on Windows (Portuguese locale) opens correctly.
     - QUOTE_ALL ensures every field is quoted, preventing any in-field comma from
@@ -794,7 +907,7 @@ def _build_csv(rows: list[dict]) -> bytes:
     output = io.StringIO()
     writer = csv.DictWriter(
         output,
-        fieldnames=["matricula", "email", "cmid", "slot", "comentario", "max_mark", "name", "question_text", "answer"],
+        fieldnames=SCORE_CSV_FIELDS if score_mode else FEEDBACK_CSV_FIELDS,
         extrasaction="ignore",
         lineterminator="\r\n",   # Windows-style line endings for Excel compatibility
         quoting=csv.QUOTE_ALL,

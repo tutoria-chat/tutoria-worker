@@ -21,6 +21,11 @@ class GradingJob(BaseModel):
     error_message = Column("ErrorMessage", Text, nullable=True)
     processed_at = Column("ProcessedAt", DateTime(timezone=True), nullable=True)
     grading_criteria = Column("GradingCriteria", Text, nullable=True)
+    # "feedback" (default; never a grade) or "score" (corporate only) — snapshotted by TutoriaApi.
+    grading_mode = Column("GradingMode", String(20), nullable=False, default="feedback")
+    # Audit, written here: which model produced the result and with which prompt version.
+    model_used = Column("ModelUsed", String(200), nullable=True)
+    prompt_version = Column("PromptVersion", String(50), nullable=True)
 
     __table_args__ = (
         CheckConstraint(
