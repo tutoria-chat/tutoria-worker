@@ -1,0 +1,25 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "GitHubActionsTutoriaBackends",
+      "Effect": "Allow",
+      "Principal": { "Federated": "arn:aws:iam::061100493246:oidc-provider/token.actions.githubusercontent.com" },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": [
+            "repo:tutoria-chat/tutoria-worker:ref:refs/heads/main",
+            "repo:tutoria-chat/tutoria-worker:environment:production",
+            "repo:tutoria-chat/tutoria-api:ref:refs/heads/main",
+            "repo:tutoria-chat/tutoria-api:environment:dev",
+            "repo:tutoria-chat/tutoria-api:environment:production",
+            "repo:tutoria-chat/TutoriaApi:environment:development",
+            "repo:tutoria-chat/TutoriaApi:environment:production"
+          ]
+        }
+      }
+    }
+  ]
+}

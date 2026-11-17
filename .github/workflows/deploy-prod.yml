@@ -26,6 +26,10 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       railway: ${{ steps.read.outputs.railway }}
+      aws_role: ${{ steps.read.outputs.aws_role }}
+      ecs_exec: ${{ steps.read.outputs.ecs_exec }}
+      ecs_infra: ${{ steps.read.outputs.ecs_infra }}
+      ecs_task: ${{ steps.read.outputs.ecs_task }}
       aws: ${{ steps.read.outputs.aws }}
       azure: ${{ steps.read.outputs.azure }}
       tenant: ${{ steps.read.outputs.tenant }}
@@ -50,6 +54,11 @@ jobs:
           test -f "$f" || { echo "::error::$f is missing (is it git-ignored?)"; exit 1; }
           get() { sed -n "s/^$1=//p" "$f" | tail -n1 | tr -d '\r'; }
           for k in RAILWAY AWS AZURE; do v=$(get $k); case "$v" in true|false) ;; *) echo "::error::$k in $f must be true or false, is '$v'"; exit 1 ;; esac; done
+          if [ "$(get AWS)" = true ]; then
+            for k in AWS_DEPLOY_ROLE_ARN ECS_TASK_EXECUTION_ROLE_ARN ECS_INFRASTRUCTURE_ROLE_ARN ECS_TASK_ROLE_ARN; do
+              [ -n "$(get $k)" ] || { echo "::error::AWS=true but $k is empty in $f"; exit 1; }
+            done
+          fi
           if [ "$(get AZURE)" = true ]; then
             for k in AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_CLIENT_ID AZURE_REGISTRY AZURE_RESOURCE_GROUP; do
               [ -n "$(get $k)" ] || { echo "::error::AZURE=true but $k is empty in $f"; exit 1; }
@@ -57,6 +66,10 @@ jobs:
           fi
           {
             echo "railway=$(get RAILWAY)"
+            echo "aws_role=$(get AWS_DEPLOY_ROLE_ARN)"
+            echo "ecs_exec=$(get ECS_TASK_EXECUTION_ROLE_ARN)"
+            echo "ecs_infra=$(get ECS_INFRASTRUCTURE_ROLE_ARN)"
+            echo "ecs_task=$(get ECS_TASK_ROLE_ARN)"
             echo "aws=$(get AWS)"
             echo "azure=$(get AZURE)"
             echo "tenant=$(get AZURE_TENANT_ID)"
@@ -138,26 +151,16 @@ jobs:
       id-token: write # OIDC, once AWS_DEPLOY_ROLE_ARN exists
     environment:
       name: production
-    env:
-      AWS_DEPLOY_ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+      # GitHub OIDC only: the role is in deploy/<env>.env, no keys anywhere.
       - name: Configure AWS credentials (OIDC role)
-        if: env.AWS_DEPLOY_ROLE_ARN != ''
         uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
         with:
-          role-to-assume: ${{ env.AWS_DEPLOY_ROLE_ARN }}
+          role-to-assume: ${{ needs.targets.outputs.aws_role }}
           role-session-name: gha-tutoria-worker-prod-${{ github.run_id }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Configure AWS credentials (access keys, until OIDC is set up)
-        if: env.AWS_DEPLOY_ROLE_ARN == ''
-        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
@@ -184,9 +187,9 @@ jobs:
           service-name: ${{ env.ECS_SERVICE }}
           cluster: ${{ env.ECS_CLUSTER }}
           image: ${{ steps.build-image.outputs.image }}
-          execution-role-arn: ${{ secrets.ECS_TASK_EXECUTION_ROLE_ARN }}
-          infrastructure-role-arn: ${{ secrets.ECS_INFRASTRUCTURE_ROLE_ARN }}
-          task-role-arn: ${{ secrets.ECS_TASK_ROLE_ARN }}
+          execution-role-arn: ${{ needs.targets.outputs.ecs_exec }}
+          infrastructure-role-arn: ${{ needs.targets.outputs.ecs_infra }}
+          task-role-arn: ${{ needs.targets.outputs.ecs_task }}
           container-port: 8001
           health-check-path: /health
           cpu: 1024
