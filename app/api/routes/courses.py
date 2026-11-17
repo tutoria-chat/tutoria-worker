@@ -118,19 +118,13 @@ async def upload_quiz_file(
         db.refresh(job)
 
         # Upload file to S3: quiz-upload-jobs/courses/{course_id}/{job_id}/{filename}
-        from app.services.blob_storage import BlobStorageService
         import asyncio
-        import boto3
 
         s3_key = f"quiz-upload-jobs/courses/{course_id}/{job.id}/{file.filename}"
         try:
-            blob = BlobStorageService()
-            s3 = boto3.client(
-                "s3",
-                region_name=settings.AWS_REGION,
-                aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-                aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-            )
+            from app.core.aws import s3_client
+
+            s3 = s3_client()
             await asyncio.to_thread(
                 s3.put_object,
                 Bucket=settings.S3_BUCKET_NAME,
@@ -148,28 +142,18 @@ async def upload_quiz_file(
         job.input_s3_key = s3_key
         db.commit()
 
-        # Send SQS message (non-blocking) — worker will extract and store questions
-        quiz_upload_url = settings.SQS_QUIZ_UPLOAD_QUEUE_URL
-        if quiz_upload_url:
+        # Queue the job (JOB_QUEUE: SQS or "WorkerJobs") — the runner extracts and stores the questions
+        from app.stores import jobs as _jobs
+
+        if _jobs.queue_available("quiz_upload"):
             try:
-                import json as _json
-                sqs = boto3.client(
-                    "sqs",
-                    region_name=settings.AWS_REGION,
-                    aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-                    aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-                )
-                await asyncio.to_thread(
-                    sqs.send_message,
-                    QueueUrl=quiz_upload_url,
-                    MessageBody=_json.dumps({"job_id": job.id, "course_id": course_id}),
-                )
-                logger.info(f"📨 SQS quiz-upload message sent for job {job.id}")
-            except Exception as sqs_err:
-                # Non-fatal: job is created, but SQS message failed
-                logger.warning(f"⚠️ Failed to send SQS message for quiz upload job {job.id}: {sqs_err}")
+                await asyncio.to_thread(_jobs.enqueue, "quiz_upload", {"job_id": job.id, "course_id": course_id})
+                logger.info(f"📨 quiz-upload job queued for job {job.id}")
+            except Exception as queue_err:
+                # Non-fatal: job is created, but queueing failed
+                logger.warning(f"⚠️ Failed to queue quiz upload job {job.id}: {queue_err}")
         else:
-            logger.warning("SQS_QUIZ_UPLOAD_QUEUE_URL not configured — quiz upload job will not process automatically")
+            logger.warning("No queue for quiz uploads (SQS_QUIZ_UPLOAD_QUEUE_URL) — quiz upload job will not process automatically")
 
         logger.info(f"Created quiz upload job {job.id} for course {course_id} ({file.filename})")
 

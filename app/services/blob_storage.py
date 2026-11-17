@@ -46,17 +46,12 @@ class BlobStorageService:
             raise ValueError("S3 bucket name not configured (S3_BUCKET_NAME)")
 
         try:
-            # Build S3 client — use explicit creds if provided, else default credential chain
-            s3_kwargs = {
-                "region_name": settings.S3_REGION or settings.AWS_REGION or "us-east-2"
-            }
-            if settings.AWS_ACCESS_KEY_ID and settings.AWS_SECRET_ACCESS_KEY:
-                s3_kwargs["aws_access_key_id"] = settings.AWS_ACCESS_KEY_ID
-                s3_kwargs["aws_secret_access_key"] = settings.AWS_SECRET_ACCESS_KEY
+            # AWS S3, or the S3-compatible store at S3_ENDPOINT_URL (app/core/aws.py).
+            from app.core.aws import s3_client_kwargs
 
-            self.s3_client = boto3.client("s3", **s3_kwargs)
+            self.s3_client = boto3.client("s3", **s3_client_kwargs())
             self.bucket_name = settings.S3_BUCKET_NAME
-            self.region = s3_kwargs["region_name"]
+            self.region = settings.S3_REGION or settings.AWS_REGION or "us-east-2"
             logger.info(f"S3 storage initialized: bucket={self.bucket_name}, region={self.region}")
         except Exception as e:
             logger.error(f"Failed to initialize S3 storage service: {e}")
@@ -91,7 +86,9 @@ class BlobStorageService:
             )
 
             # Return the S3 object URL
-            return f"https://{self.bucket_name}.s3.{self.region}.amazonaws.com/{blob_path}"
+            from app.core.aws import s3_object_url
+
+            return s3_object_url(self.bucket_name, blob_path)
 
         except Exception as e:
             logger.error(f"Failed to upload file to S3: {e}")
@@ -180,11 +177,14 @@ class BlobStorageService:
     def extract_blob_path_from_url(self, blob_url: str) -> Optional[str]:
         """Extract S3 key from URL"""
         try:
-            # S3 URL format: https://{bucket}.s3.{region}.amazonaws.com/{key}
-            prefix = f"https://{self.bucket_name}.s3.{self.region}.amazonaws.com/"
-            if blob_url.startswith(prefix):
-                key = blob_url[len(prefix):].split("?")[0]  # Remove query params if present
-                return key
+            # AWS: https://{bucket}.s3.{region}.amazonaws.com/{key}
+            # S3-compatible endpoint: {S3_ENDPOINT_URL}/{bucket}/{key}
+            prefixes = [f"https://{self.bucket_name}.s3.{self.region}.amazonaws.com/"]
+            if settings.S3_ENDPOINT_URL:
+                prefixes.append(f"{settings.S3_ENDPOINT_URL.rstrip('/')}/{self.bucket_name}/")
+            for prefix in prefixes:
+                if blob_url.startswith(prefix):
+                    return blob_url[len(prefix):].split("?")[0]  # Remove query params if present
             return None
         except Exception:
             return None

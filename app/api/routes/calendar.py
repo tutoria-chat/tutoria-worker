@@ -10,7 +10,6 @@ import json as _json
 import logging
 from datetime import datetime, timezone
 
-import boto3
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -61,12 +60,9 @@ async def process_calendar_import(
             ics_text = await asyncio.to_thread(fetch_ics, payload.ics_url)
             events = parse_ics(ics_text)
         else:
-            s3 = boto3.client(
-                "s3",
-                region_name=settings.AWS_REGION,
-                aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-                aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-            )
+            from app.core.aws import s3_client
+
+            s3 = s3_client()
             response = await asyncio.to_thread(
                 s3.get_object, Bucket=settings.S3_BUCKET_NAME, Key=s3_key
             )

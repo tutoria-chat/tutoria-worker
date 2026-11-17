@@ -625,15 +625,10 @@ Document:
         # Primary: download via S3 SDK using blob_path (works for private buckets)
         if file.blob_path and settings.S3_BUCKET_NAME:
             try:
-                import boto3
+                from app.core.aws import s3_client
 
                 def _s3_download() -> bytes:
-                    s3_kwargs = {"region_name": settings.AWS_REGION}
-                    if settings.AWS_ACCESS_KEY_ID and settings.AWS_SECRET_ACCESS_KEY:
-                        s3_kwargs["aws_access_key_id"] = settings.AWS_ACCESS_KEY_ID
-                        s3_kwargs["aws_secret_access_key"] = settings.AWS_SECRET_ACCESS_KEY
-                    s3_client = boto3.client("s3", **s3_kwargs)
-                    resp = s3_client.get_object(
+                    resp = s3_client().get_object(
                         Bucket=settings.S3_BUCKET_NAME,
                         Key=file.blob_path,
                     )

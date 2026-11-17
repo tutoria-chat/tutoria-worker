@@ -1,14 +1,15 @@
 """
-DynamoDB Service for tutoria-worker.
+Chat history and quiz answers for the analytics workers.
 
-Provides access to ChatMessages and QuizAttempts tables for analytics workers.
-Reuses the same lazy-init pattern as tutoria-api/dynamodb_chat_service.py.
+The reads go through the CHAT_STORE stores (app/stores/): DynamoDB or
+Postgres. get_chat_table / get_quiz_attempts_table / batch_add_ttl are the
+DynamoDB-only leftovers (the one-time TTL backfill).
 """
 import logging
 import time
 import uuid
 from typing import Optional, List, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from app.core.config import settings
 
@@ -26,13 +27,8 @@ def _get_dynamodb_resource():
         return _dynamodb
 
     try:
-        import boto3
-        _dynamodb = boto3.resource(
-            'dynamodb',
-            aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-            region_name=settings.AWS_REGION
-        )
+        from app.core.aws import dynamodb_resource
+        _dynamodb = dynamodb_resource()
         logger.info("DynamoDB resource initialized")
         return _dynamodb
     except ImportError:
@@ -73,83 +69,32 @@ def get_quiz_attempts_table():
 
 def query_module_messages(module_id: int, start_ts: int, end_ts: int) -> List[Dict[str, Any]]:
     """
-    Query all chat messages for a module in a time range using ModuleAnalyticsIndex.
-    Handles pagination automatically.
-
-    Args:
-        module_id: Module ID to query
-        start_ts: Start timestamp in epoch milliseconds
-        end_ts: End timestamp in epoch milliseconds
-
-    Returns:
-        List of message items
+    All chat messages for a module in a time range (epoch ms), oldest first.
+    CHAT_STORE: the DynamoDB ModuleAnalyticsIndex or Postgres "ChatHistory".
     """
-    table = get_chat_table()
-    if table is None:
-        logger.warning("[DynamoDB DISABLED] Cannot query module messages")
+    from app.stores.chat_messages import chat_messages
+
+    try:
+        store = chat_messages()
+    except Exception as e:
+        logger.warning(f"[Chat store unavailable] Cannot query module messages: {e}")
         return []
-
-    from boto3.dynamodb.conditions import Key
-
-    all_items = []
-    exclusive_start_key = None
-
-    while True:
-        query_kwargs = {
-            'IndexName': 'ModuleAnalyticsIndex',
-            'KeyConditionExpression': Key('moduleId').eq(module_id) & Key('timestamp').between(start_ts, end_ts),
-        }
-        if exclusive_start_key:
-            query_kwargs['ExclusiveStartKey'] = exclusive_start_key
-
-        response = table.query(**query_kwargs)
-        all_items.extend(response.get('Items', []))
-
-        exclusive_start_key = response.get('LastEvaluatedKey')
-        if not exclusive_start_key:
-            break
-
-    return all_items
+    return store.query("module", module_id, start_ts=start_ts, end_ts=end_ts)
 
 
 def query_module_quiz_attempts(module_id: int, start_ts: int, end_ts: int) -> List[Dict[str, Any]]:
     """
-    Query quiz attempts for a module in a time range.
-    QuizAttempts table PK: moduleId + timestamp.
-
-    Args:
-        module_id: Module ID to query
-        start_ts: Start timestamp in epoch milliseconds
-        end_ts: End timestamp in epoch milliseconds
-
-    Returns:
-        List of quiz attempt items
+    Quiz answers for a module in a time range (epoch ms), oldest first.
+    CHAT_STORE: the DynamoDB QuizAttempts table or Postgres "QuizAttemptAnswers".
     """
-    table = get_quiz_attempts_table()
-    if table is None:
-        logger.warning("[DynamoDB DISABLED] Cannot query quiz attempts")
+    from app.stores.quiz_attempts import quiz_attempts
+
+    try:
+        store = quiz_attempts()
+    except Exception as e:
+        logger.warning(f"[Quiz store unavailable] Cannot query quiz attempts: {e}")
         return []
-
-    from boto3.dynamodb.conditions import Key
-
-    all_items = []
-    exclusive_start_key = None
-
-    while True:
-        query_kwargs = {
-            'KeyConditionExpression': Key('moduleId').eq(module_id) & Key('timestamp').between(start_ts, end_ts),
-        }
-        if exclusive_start_key:
-            query_kwargs['ExclusiveStartKey'] = exclusive_start_key
-
-        response = table.query(**query_kwargs)
-        all_items.extend(response.get('Items', []))
-
-        exclusive_start_key = response.get('LastEvaluatedKey')
-        if not exclusive_start_key:
-            break
-
-    return all_items
+    return store.by_module_between(module_id, start_ts, end_ts)
 
 
 def save_quiz_attempt(
@@ -163,19 +108,13 @@ def save_quiz_attempt(
     concepts_covered: str = "",
     difficulty: str = "medium",
 ) -> str:
-    """Save a single quiz attempt to DynamoDB with 90-day TTL."""
-    table = get_quiz_attempts_table()
+    """Save a single quiz answer (90-day retention)."""
+    from app.stores.quiz_attempts import quiz_attempts
+
     attempt_id = str(uuid.uuid4())
-    timestamp = int(time.time() * 1000)
-    ttl_seconds = int(time.time()) + (90 * 86400)
-
-    if table is None:
-        logger.info(f"[DynamoDB DISABLED] Would save quiz attempt: module={module_id}, student={student_id}")
-        return attempt_id
-
-    item = {
+    quiz_attempts().put({
         'moduleId': module_id,
-        'timestamp': timestamp,
+        'timestamp': int(time.time() * 1000),
         'attemptId': attempt_id,
         'studentId': student_id,
         'quizId': quiz_id,
@@ -186,16 +125,8 @@ def save_quiz_attempt(
         'conceptsCovered': concepts_covered,
         'difficulty': difficulty,
         'createdAt': datetime.utcnow().isoformat(),
-        'ttl': ttl_seconds,
-    }
-
-    try:
-        table.put_item(Item=item)
-        logger.debug(f"Saved quiz attempt {attempt_id} to DynamoDB")
-        return attempt_id
-    except Exception as e:
-        logger.error(f"Failed to save quiz attempt to DynamoDB: {e}")
-        raise
+    })
+    return attempt_id
 
 
 def batch_add_ttl(table_name: str = "chat", items_to_update: Optional[List[Dict]] = None):
@@ -208,6 +139,9 @@ def batch_add_ttl(table_name: str = "chat", items_to_update: Optional[List[Dict]
         items_to_update: If provided, update these specific items.
                         Otherwise scans for items missing 'ttl'.
     """
+    if settings.CHAT_STORE != "dynamodb":
+        logger.info("TTL backfill is DynamoDB only (CHAT_STORE=%s): nothing to do", settings.CHAT_STORE)
+        return 0
     table = get_chat_table() if table_name == "chat" else get_quiz_attempts_table()
     if table is None:
         logger.warning("[DynamoDB DISABLED] Cannot backfill TTL")

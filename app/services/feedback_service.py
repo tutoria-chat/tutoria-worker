@@ -42,17 +42,11 @@ def _save_feedback_to_chat(
     file_name: str,
     matricula: Optional[str],
 ) -> Optional[str]:
-    """Record the feedback interaction in the ChatMessages table (90-day TTL)."""
-    from app.services.dynamodb_service import get_chat_table
-
-    table = get_chat_table()
-    if table is None:
-        logger.info("[DynamoDB disabled] Skipping feedback chat record")
-        return None
+    """Record the feedback interaction in the chat history (CHAT_STORE, 90-day retention)."""
+    from app.stores.chat_messages import chat_messages
 
     try:
         message_id = str(uuid.uuid4())
-        now = datetime.now(timezone.utc)
         item = {
             "conversationId": conversation_id,
             "timestamp": int(time.time() * 1000),
@@ -65,15 +59,14 @@ def _save_feedback_to_chat(
             "provider": provider,
             "hasFile": True,
             "fileName": file_name,
-            "createdAt": now.isoformat(),
-            "ttl": int(time.time()) + (90 * 86400),
+            "createdAt": datetime.now(timezone.utc).isoformat(),
         }
         if matricula:
             item["matricula"] = matricula
-        table.put_item(Item=item)
+        chat_messages().put(item)
         return message_id
     except Exception as e:
-        logger.warning(f"Failed to save feedback to DynamoDB: {e}")
+        logger.warning(f"Failed to save feedback to the chat history: {e}")
         return None
 
 

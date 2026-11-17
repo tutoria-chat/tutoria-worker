@@ -60,3 +60,6 @@ alembic/versions/
 
 # Docker
 .dockerignore
+
+# Deploy targets and Azure ids (not secrets): must be in git, the workflows read them.
+!deploy/*.env

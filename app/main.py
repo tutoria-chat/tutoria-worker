@@ -19,16 +19,46 @@ from app.workers.ttl_backfill_worker import run_ttl_backfill
 logger = logging.getLogger(__name__)
 
 
+async def _ensure_postgres_stores(attempts: int = 5, wait_seconds: float = 3.0) -> None:
+    from app.core.database import engine
+    from app.stores.schema import ensure_schema
+
+    for attempt in range(1, attempts + 1):
+        try:
+            await asyncio.to_thread(ensure_schema, engine)
+            return
+        except Exception as exc:
+            if attempt == attempts:
+                raise
+            logger.warning("Postgres stores not ready (%s), attempt %d/%d", type(exc).__name__, attempt, attempts)
+            await asyncio.sleep(wait_seconds)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start background workers on startup; they run until the process exits."""
     tasks = []
 
-    logger.info("🚀 Starting tutoria-worker background jobs...")
+    from app.core import config_source
+    logger.info(
+        "🚀 Starting tutoria-worker — config: %s | env=%s chat_store=%s job_queue=%s storage=%s",
+        config_source.loaded_from, settings.ENVIRONMENT, settings.CHAT_STORE, settings.JOB_QUEUE,
+        "s3-compatible" if settings.S3_ENDPOINT_URL else "aws-s3",
+    )
 
-    # SQS consumers — react to on-upload extraction and quiz-gen triggers from .NET API
-    tasks.append(asyncio.create_task(run_sqs_workers(), name="sqs-workers"))
-    logger.info("  ✅ SQS workers started (extraction + quiz-gen queues)")
+    # The shared Postgres tables (ChatHistory, QuizAttemptAnswers, WorkerJobs):
+    # created by whichever service starts first, under one advisory lock.
+    if settings.CHAT_STORE == "postgres" or settings.JOB_QUEUE == "postgres":
+        await _ensure_postgres_stores()
+
+    # Jobs from the .NET API and tutoria-api: SQS consumers, or the Postgres runner.
+    if settings.JOB_QUEUE == "postgres":
+        from app.workers.job_runner import run_job_runner
+        tasks.append(asyncio.create_task(run_job_runner(), name="job-runner"))
+        logger.info("  ✅ Postgres job runner started (WorkerJobs)")
+    else:
+        tasks.append(asyncio.create_task(run_sqs_workers(), name="sqs-workers"))
+        logger.info("  ✅ SQS workers started")
 
     # Every 4h: retry files with processing_status='failed'
     tasks.append(asyncio.create_task(run_failed_extraction_retry_worker(), name="failed-extraction-retry"))
@@ -161,3 +191,22 @@ async def root():
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "service": "tutoria-worker"}
+
+
+@app.get("/health/ready")
+async def health_ready():
+    """The database answers (SELECT 1)."""
+    from fastapi.responses import JSONResponse
+    from sqlalchemy import text
+    from app.core.database import engine
+
+    def _ping():
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+
+    try:
+        await asyncio.wait_for(asyncio.to_thread(_ping), timeout=5)
+    except Exception as exc:
+        logger.warning("Readiness check failed: %s", type(exc).__name__)
+        return JSONResponse(status_code=503, content={"status": "unavailable", "database": "down"})
+    return {"status": "ready", "database": "up"}

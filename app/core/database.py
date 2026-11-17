@@ -4,8 +4,20 @@ from sqlalchemy.orm import sessionmaker
 from app.core.config import settings
 from app.models.base import Base
 
+def sqlalchemy_url(url: str) -> str:
+    """
+    postgresql:// (and postgres://) -> postgresql+psycopg2://. SQLAlchemy 2.1
+    made psycopg 3 the default driver for a bare postgresql:// URL, and the
+    image only ships psycopg2: a fresh build would fail to connect.
+    """
+    for prefix in ("postgresql://", "postgres://"):
+        if url.startswith(prefix):
+            return "postgresql+psycopg2://" + url[len(prefix):]
+    return url
+
+
 engine = create_engine(
-    settings.DATABASE_URL,
+    sqlalchemy_url(settings.DATABASE_URL),
     echo=False,                 # Never log every SQL statement in production
     pool_size=10,               # Persistent connections kept open
     max_overflow=20,            # Extra connections allowed under burst load

@@ -1,5 +1,12 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 from typing import Optional
+
+from app.core.config_source import load_config_source
+
+# AWS SSM (AWS_SSM_PREFIX, e.g. /tutoria/dev/worker/) or Azure Key Vault
+# (AZURE_KEYVAULT_URL), else the plain environment (Railway, local).
+load_config_source()
 
 
 class Settings(BaseSettings):
@@ -19,9 +26,28 @@ class Settings(BaseSettings):
     AWS_SECRET_ACCESS_KEY: Optional[str] = None
     AWS_REGION: str = "us-east-2"
 
-    # S3 Storage (files — PDFs, documents)
+    # S3 Storage (files — PDFs, documents). S3_ENDPOINT_URL (+ S3_ACCESS_KEY_ID /
+    # S3_SECRET_ACCESS_KEY) points at an S3-compatible store (Cloudflare R2 on
+    # Azure); unset = AWS S3 with the AWS credentials, as before.
     S3_BUCKET_NAME: str = "tutoria-files-dev"
     S3_REGION: str = "us-east-2"
+    S3_ENDPOINT_URL: str = ""
+    S3_ACCESS_KEY_ID: Optional[str] = None
+    S3_SECRET_ACCESS_KEY: Optional[str] = None
+
+    # Chat history + quiz answers: "dynamodb" (as before) or "postgres"
+    # ("ChatHistory" / "QuizAttemptAnswers"; tutoria-api docs/MULTICLOUD.md).
+    CHAT_STORE: str = "dynamodb"
+    # Where jobs come from: "sqs" (the queues below) or "postgres" ("WorkerJobs",
+    # claimed with SKIP LOCKED by app/workers/job_runner.py).
+    JOB_QUEUE: str = "sqs"
+    # Postgres runner: jobs at once, delivery attempts before "failed" (the DLQ's
+    # maxReceiveCount), and how long a claim holds before another runner may take it
+    # (renewed every minute while the job runs).
+    JOB_CONCURRENCY: int = 2
+    JOB_MAX_ATTEMPTS: int = 3
+    JOB_LEASE_SECONDS: int = 300
+    JOB_POLL_SECONDS: float = 5.0
 
     # AI Provider API Keys
     OPENAI_API_KEY: str = "sk-proj-example"
@@ -88,6 +114,16 @@ class Settings(BaseSettings):
 
     # Application
     debug: bool = False
+    ENVIRONMENT: str = "local"
+
+    @field_validator("CHAT_STORE", "JOB_QUEUE")
+    @classmethod
+    def _store_choice(cls, value: str, info):
+        allowed = {"CHAT_STORE": {"dynamodb", "postgres"}, "JOB_QUEUE": {"sqs", "postgres"}}[info.field_name]
+        value = (value or "").strip().lower()
+        if value not in allowed:
+            raise ValueError(f"{info.field_name} must be one of {sorted(allowed)}, is {value!r}")
+        return value
 
     class Config:
         env_file = ".env"

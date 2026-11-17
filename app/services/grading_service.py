@@ -38,7 +38,6 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 
-import boto3
 from botocore.exceptions import ClientError
 from sqlalchemy.orm import Session, joinedload
 
@@ -471,12 +470,10 @@ def _sanitize_comment(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _get_s3():
-    return boto3.client(
-        "s3",
-        region_name=settings.AWS_REGION,
-        aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-    )
+    # AWS S3 or the S3-compatible store at S3_ENDPOINT_URL (app/core/aws.py).
+    from app.core.aws import s3_client
+
+    return s3_client()
 
 
 async def _download_s3_json(s3_key: str) -> list:

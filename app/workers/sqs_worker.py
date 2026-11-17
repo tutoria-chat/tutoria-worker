@@ -16,7 +16,6 @@ import json
 import logging
 from typing import Optional
 
-import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
 
 from app.core.config import settings
@@ -41,12 +40,9 @@ def _loggable(body: dict) -> dict:
 
 
 def _get_sqs_client():
-    return boto3.client(
-        "sqs",
-        region_name=settings.AWS_REGION,
-        aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-    )
+    from app.core.aws import sqs_client
+
+    return sqs_client()
 
 
 async def _process_extraction_message(body: dict) -> None:
@@ -189,7 +185,6 @@ async def _process_quiz_upload_message(body: dict) -> None:
         from app.models import QuizUploadJob, Course as CourseModel
         from app.services.quiz_extractor import extract_text_from_file, QuizExtractorService
         import json as _json
-        import boto3
         import asyncio
 
         job = db.query(QuizUploadJob).filter(QuizUploadJob.id == job_id).first()
@@ -209,12 +204,8 @@ async def _process_quiz_upload_message(body: dict) -> None:
 
         # Download file from S3
         from app.core.config import settings as _settings
-        s3 = boto3.client(
-            "s3",
-            region_name=_settings.AWS_REGION,
-            aws_access_key_id=_settings.AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=_settings.AWS_SECRET_ACCESS_KEY,
-        )
+        from app.core.aws import s3_client
+        s3 = s3_client()
         response = await asyncio.to_thread(
             s3.get_object, Bucket=_settings.S3_BUCKET_NAME, Key=job.input_s3_key
         )
