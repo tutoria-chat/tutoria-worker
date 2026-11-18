@@ -95,8 +95,10 @@ def _get_service(provider: str, dummy_module, model_name: str, db: Session):
         from app.services.deepseek_service import DeepSeekService
         return DeepSeekService(module=dummy_module, model_name=model_name, db=db)
     elif provider == "bedrock":
-        from app.services.bedrock_service import BedrockService
-        return BedrockService(module=dummy_module, db=db)
+        # The worker has no Bedrock client (only tutoria-api does): skip to the
+        # next formatting model instead of failing on the import.
+        logger.debug("Formatting: skipping %s, Bedrock is not available in the worker", model_name)
+        return None
     elif provider == "xai":
         from app.services.xai_service import XAIService
         return XAIService(module=dummy_module, model_name=model_name, db=db)
