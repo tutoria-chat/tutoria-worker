@@ -195,7 +195,7 @@ jobs:
           cpu: 1024
           memory: 2048
           min-task-count: 1
-          max-task-count: 3
+          max-task-count: 1 # the daily workers have no cross-task lock: one task, like Railway
           auto-scaling-metric: AVERAGE_CPU
           auto-scaling-target-value: 70
           environment-variables: '[{"name":"ENVIRONMENT","value":"prod"},{"name":"AWS_SSM_PREFIX","value":"/tutoria/prod/worker/"},{"name":"AWS_REGION","value":"us-east-2"}]'
