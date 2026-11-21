@@ -14,8 +14,10 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import text
 
 from app.core.config import settings
+from app.stores.chat_messages import clip
 
 RETENTION_DAYS = 90
+_LIMITS = {"Difficulty": 30}
 
 _COLUMNS = {
     "attemptId": "AttemptId",
@@ -100,6 +102,7 @@ class PostgresQuizAttempts:
             "CreatedAt": created or now,
             "ExpiresAt": now + timedelta(days=RETENTION_DAYS),
         })
+        clip(row, _LIMITS)
         columns = ", ".join(f'"{c}"' for c in row)
         values = ", ".join(f":{c}" for c in row)
         with self.engine.begin() as conn:

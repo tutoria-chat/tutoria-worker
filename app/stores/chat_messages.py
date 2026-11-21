@@ -43,6 +43,20 @@ _COLUMNS = {
     "createdAt": "CreatedAt",
 }
 
+# Display fields with a column limit: longer values (an upload's file name is
+# whatever the student's file was called) are trimmed so the write never fails.
+_LIMITS = {"FileName": 500, "ModelUsed": 200, "Provider": 100, "Matricula": 100}
+
+
+def clip(row: Dict[str, Any], limits: Dict[str, int] = _LIMITS) -> Dict[str, Any]:
+    """Trims the string columns in `limits` to their size, in place."""
+    for column, size in limits.items():
+        value = row.get(column)
+        if isinstance(value, str) and len(value) > size:
+            row[column] = value[:size]
+    return row
+
+
 # Which key each query filters on, and its DynamoDB index.
 _FILTERS = {
     "conversation": ("conversationId", "ConversationId", None),
@@ -134,6 +148,7 @@ class PostgresChatMessages:
         row["Response"] = row["Response"] or ""
         row["HasFile"] = bool(row["HasFile"])
         row["ExpiresAt"] = now + timedelta(days=RETENTION_DAYS)
+        clip(row)
         columns = ", ".join(f'"{c}"' for c in row)
         values = ", ".join(f":{c}" for c in row)
         with self.engine.begin() as conn:

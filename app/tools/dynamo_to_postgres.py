@@ -75,7 +75,7 @@ def chat_row(item: Dict[str, Any], now: datetime) -> Dict[str, Any]:
         "CreatedAt": _created(row["CreatedAt"], now),
         "ExpiresAt": _expires(item, now),
     })
-    return row
+    return chat_messages.clip(row)
 
 
 def quiz_row(item: Dict[str, Any], now: datetime) -> Dict[str, Any]:
@@ -95,7 +95,7 @@ def quiz_row(item: Dict[str, Any], now: datetime) -> Dict[str, Any]:
         "CreatedAt": _created(row["CreatedAt"], now),
         "ExpiresAt": _expires(item, now),
     })
-    return row
+    return chat_messages.clip(row, quiz_attempts._LIMITS)
 
 
 # Table -> (row builder, the DynamoDB key as columns: a row with the same
