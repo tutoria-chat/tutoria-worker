@@ -24,6 +24,17 @@ from app.services.document_context_service import DocumentContextService
 
 logger = logging.getLogger(__name__)
 
+# Existing questions shown to the AI so a new run doesn't repeat them: the most
+# recent ones, each cut short, so the prompt stays bounded on a big bank.
+_MAX_EXISTING_QUESTIONS = 150
+_EXISTING_QUESTION_CHARS = 200
+
+_AVOID_HEADERS = {
+    "pt-br": "QUESTÕES QUE JÁ EXISTEM (não repita nem reformule nenhuma; cubra outros pontos do material)",
+    "en": "QUESTIONS THAT ALREADY EXIST (do not repeat or rephrase any of them; cover other points of the material)",
+    "es": "PREGUNTAS QUE YA EXISTEN (no repitas ni reformules ninguna; cubre otros puntos del material)",
+}
+
 
 class QuizGeneratorService:
     """Service for generating pre-generated quiz questions for modules."""
@@ -45,6 +56,7 @@ class QuizGeneratorService:
         self.module = module
         self.db = db
         self._course_materials = ""  # Populated by generate_quiz_bank
+        self._existing_questions: List[str] = []  # Populated by generate_quiz_bank
 
     async def generate_quiz_bank(self, count: int = 50) -> List[Quiz]:
         """
@@ -100,18 +112,24 @@ class QuizGeneratorService:
             logger.error(error_msg)
             raise ValueError(error_msg)
 
-        # Delete any existing ai_generated quizzes generated FROM THIS MODULE before
-        # regenerating. The bank is course-wide, so this must stay scoped by
-        # module_id (provenance) — never by course_id, or a regeneration would
-        # wipe every sibling module's questions too.
-        deleted = (
-            self.db.query(Quiz)
-            .filter(Quiz.module_id == self.module.id, Quiz.source == "ai_generated")
-            .delete(synchronize_session=False)
-        )
-        self.db.commit()
-        if deleted:
-            logger.info(f"🗑️  Deleted {deleted} existing ai_generated quizzes for module {self.module.id} before regenerating")
+        # Generation always ADDS to the bank: "Gerar com IA" used to delete this
+        # module's ai_generated questions first, so asking for more wiped the
+        # ones the professor already had. Instead, the questions already there
+        # go into the prompt so the AI writes new ones rather than repeats.
+        self._existing_questions = [
+            text[:_EXISTING_QUESTION_CHARS]
+            for (text,) in self.db.query(Quiz.question_text)
+            .filter(Quiz.module_id == self.module.id)
+            .order_by(Quiz.id.desc())
+            .limit(_MAX_EXISTING_QUESTIONS)
+            .all()
+            if text
+        ]
+        if self._existing_questions:
+            logger.info(
+                f"Module {self.module.id} already has questions: keeping them, "
+                f"asking for {count} new ones (avoiding {len(self._existing_questions)})"
+            )
 
         # Calculate difficulty distribution
         easy_count = int(count * 0.4)  # 40%
@@ -145,6 +163,8 @@ class QuizGeneratorService:
                     difficulty, diff_count, start_number=start
                 )
                 all_quizzes.extend(quizzes)
+                # The next difficulty level must not repeat these either.
+                self._existing_questions[:0] = [q.question_text[:_EXISTING_QUESTION_CHARS] for q in quizzes]
             except Exception as e:
                 logger.error(f"Failed to generate {difficulty.value} questions: {e}")
                 errors.append(f"{difficulty.value}: {str(e)[:200]}")
@@ -476,6 +496,12 @@ class QuizGeneratorService:
             if len(course_materials) > max_materials_length:
                 course_materials = course_materials[:max_materials_length] + "\n[... content truncated ...]"
             module_context += f"\n\n=== COURSE MATERIALS ===\n{course_materials}\n=== END MATERIALS ==="
+
+        existing = getattr(self, '_existing_questions', None) or []
+        if existing:
+            header = _AVOID_HEADERS.get(tutor_language, _AVOID_HEADERS["pt-br"])
+            listed = "\n".join(f"- {q}" for q in existing[:_MAX_EXISTING_QUESTIONS])
+            module_context += f"\n\n=== {header} ===\n{listed}\n=== END ==="
 
         # Note: OpenAI response_format: json_object requires the response to be a JSON OBJECT
         # (not a bare array), so we wrap in {"questions": [...]}
