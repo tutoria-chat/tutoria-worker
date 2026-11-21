@@ -20,12 +20,13 @@ logger = logging.getLogger(__name__)
 
 
 async def _ensure_postgres_stores(attempts: int = 5, wait_seconds: float = 3.0) -> None:
+    """Waits for the shared tables (TutoriaApi's migrations create them)."""
     from app.core.database import engine
-    from app.stores.schema import ensure_schema
+    from app.stores.schema import check_schema
 
     for attempt in range(1, attempts + 1):
         try:
-            await asyncio.to_thread(ensure_schema, engine)
+            await asyncio.to_thread(check_schema, engine)
             return
         except Exception as exc:
             if attempt == attempts:

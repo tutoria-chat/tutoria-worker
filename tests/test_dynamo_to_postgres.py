@@ -78,10 +78,10 @@ pg = pytest.mark.skipif(not PG_URL, reason="TEST_DATABASE_URL not set")
 @pytest.fixture
 def pg_engine():
     from app.core.database import sqlalchemy_url
-    from app.stores.schema import ensure_schema
+    from tests.test_cloud_portability import create_test_tables
 
     engine = create_engine(sqlalchemy_url(PG_URL))
-    ensure_schema(engine)
+    create_test_tables(engine)
     with engine.begin() as conn:
         conn.execute(text('DELETE FROM "ChatHistory"'))
         conn.execute(text('DELETE FROM "QuizAttemptAnswers"'))
@@ -122,16 +122,16 @@ def test_copied_rows_read_back_through_the_postgres_store(pg_engine):
     assert answer["attemptId"] == "a-1" and answer["isCorrect"] is True
 
 
-def test_long_display_fields_are_trimmed_to_the_column():
+def test_long_display_fields_are_trimmed_to_the_column_but_file_names_kept():
     row = tool.chat_row(chat_item(fileName="x" * 533, provider="p" * 150), NOW)
-    assert len(row["FileName"]) == 500 and len(row["Provider"]) == 100
+    assert len(row["FileName"]) == 533 and len(row["Provider"]) == 100
     quiz = quiz_item()
     quiz["difficulty"] = "d" * 40
     assert len(tool.quiz_row(quiz, NOW)["Difficulty"]) == 30
 
 
 @pg
-def test_a_533_character_file_name_copies_and_saves(pg_engine):
+def test_a_533_character_file_name_is_copied_and_saved_whole(pg_engine):
     from app.stores.chat_messages import PostgresChatMessages
 
     counts = tool.copy_items(pg_engine, "ChatHistory", [chat_item(fileName="a" * 533)], apply=True)
@@ -140,4 +140,4 @@ def test_a_533_character_file_name_copies_and_saves(pg_engine):
                                          "fileName": "b" * 533, "hasFile": True})
     with pg_engine.connect() as conn:
         lengths = conn.execute(text('SELECT length("FileName") FROM "ChatHistory" ORDER BY "Id"')).scalars().all()
-    assert lengths == [500, 500]
+    assert lengths == [533, 533]

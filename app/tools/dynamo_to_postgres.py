@@ -161,7 +161,7 @@ def scan(table_name: str) -> Iterable[Dict[str, Any]]:
 
 def run(apply: bool, engine=None, scanner: Callable[[str], Iterable[Dict[str, Any]]] = scan) -> int:
     from app.core.config import settings
-    from app.stores.schema import ensure_schema
+    from app.stores.schema import check_schema
 
     if engine is None:
         from app.core.database import engine as default_engine
@@ -170,7 +170,7 @@ def run(apply: bool, engine=None, scanner: Callable[[str], Iterable[Dict[str, An
     if engine.dialect.name != "postgresql":
         logger.error("DATABASE_URL is not Postgres (%s): nothing copied", engine.dialect.name)
         return 2
-    ensure_schema(engine)
+    check_schema(engine)
     sources = {
         "ChatHistory": settings.AWS_DYNAMODB_CHAT_TABLE,
         "QuizAttemptAnswers": settings.AWS_DYNAMODB_QUIZ_ATTEMPTS_TABLE,

@@ -43,9 +43,9 @@ _COLUMNS = {
     "createdAt": "CreatedAt",
 }
 
-# Display fields with a column limit: longer values (an upload's file name is
-# whatever the student's file was called) are trimmed so the write never fails.
-_LIMITS = {"FileName": 500, "ModelUsed": 200, "Provider": 100, "Matricula": 100}
+# Our own short values with a column limit: trimmed so a surprise never fails the
+# write. (FileName, the student's upload name, is text: any length is kept.)
+_LIMITS = {"ModelUsed": 200, "Provider": 100, "Matricula": 100}
 
 
 def clip(row: Dict[str, Any], limits: Dict[str, int] = _LIMITS) -> Dict[str, Any]:

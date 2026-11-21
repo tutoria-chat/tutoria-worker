@@ -95,7 +95,8 @@ def test_shared_files_match_tutoria_api():
         pytest.skip("tutoria-api not checked out next to this repo")
     here = os.path.join(os.path.dirname(__file__), "..")
     for rel in ("app/stores/schema.py", "app/stores/chat_messages.py", "app/stores/quiz_attempts.py",
-                "app/stores/jobs.py", "app/core/config_source.py", "app/core/aws.py"):
+                "app/stores/jobs.py", "app/core/config_source.py", "app/core/aws.py",
+                "tests/postgres_tables.sql"):
         with open(os.path.join(here, rel)) as mine, open(os.path.join(api, rel)) as theirs:
             assert mine.read() == theirs.read(), rel
 
@@ -106,13 +107,23 @@ PG_URL = os.environ.get("TEST_DATABASE_URL")
 pg = pytest.mark.skipif(not PG_URL, reason="TEST_DATABASE_URL not set")
 
 
+def create_test_tables(engine):
+    """The shared tables from tests/postgres_tables.sql (TutoriaApi's migration), as
+    TutoriaApi would have created them; the services themselves only check."""
+    from app.stores.schema import check_schema
+
+    path = os.path.join(os.path.dirname(__file__), "postgres_tables.sql")
+    with open(path) as f, engine.begin() as conn:
+        conn.exec_driver_sql(f.read())
+    check_schema(engine)
+
+
 @pytest.fixture
 def pg_engine():
     from app.core.database import sqlalchemy_url
-    from app.stores.schema import ensure_schema
 
     engine = create_engine(sqlalchemy_url(PG_URL))
-    ensure_schema(engine)
+    create_test_tables(engine)
     with engine.begin() as conn:
         conn.execute(text('DELETE FROM "WorkerJobs"'))
     yield engine
