@@ -23,6 +23,21 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v2/courses", tags=["courses"])
 
 
+def _get_course(course_id: int, db: Session, current_user: dict) -> CourseModel:
+    """The course, if the caller may manage it: super admins any course, every
+    other staff role only courses of their own university (the same rule as
+    TutoriaApi's CallerOwnsModuleAsync and tutoria-api's course routes).
+    Anything else is a 404, so course ids of other universities can't be probed."""
+    course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found")
+    if (current_user or {}).get("type") != "super_admin":
+        university_id = getattr((current_user or {}).get("user"), "university_id", None)
+        if university_id is None or course.university_id != university_id:
+            raise HTTPException(status_code=404, detail="Course not found")
+    return course
+
+
 # ============================
 # Quiz Upload & Extraction
 # ============================
@@ -87,9 +102,7 @@ async def upload_quiz_file(
     logger = logging.getLogger(__name__)
 
     try:
-        course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
-        if not course:
-            raise HTTPException(status_code=404, detail="Course not found")
+        course = _get_course(course_id, db, current_user)
 
         # Validate file type
         allowed_extensions = {"pdf", "docx", "doc", "xlsx", "xls", "csv", "txt"}
@@ -182,6 +195,7 @@ async def list_quiz_upload_jobs(
 ):
     """List all quiz upload jobs for a course, newest first."""
     from app.models import QuizUploadJob
+    _get_course(course_id, db, current_user)
     jobs = (
         db.query(QuizUploadJob)
         .filter(QuizUploadJob.course_id == course_id)
@@ -216,6 +230,7 @@ async def get_quiz_upload_job_questions(
     """
     import json as _json
     from app.models import QuizUploadJob
+    _get_course(course_id, db, current_user)
     job = db.query(QuizUploadJob).filter(
         QuizUploadJob.id == job_id,
         QuizUploadJob.course_id == course_id,
@@ -255,9 +270,7 @@ async def confirm_extracted_quizzes(
     logger = logging.getLogger(__name__)
 
     try:
-        course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
-        if not course:
-            raise HTTPException(status_code=404, detail="Course not found")
+        course = _get_course(course_id, db, current_user)
 
         if not request.questions:
             raise HTTPException(status_code=400, detail="No questions to save")
@@ -316,9 +329,7 @@ async def list_course_quizzes(
     """
     from app.models import Quiz
 
-    course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
-    if not course:
-        raise HTTPException(status_code=404, detail="Course not found")
+    course = _get_course(course_id, db, current_user)
 
     query = db.query(Quiz).filter(Quiz.course_id == course_id)
 
@@ -352,9 +363,7 @@ async def delete_quiz_question(
     """
     from app.models import Quiz
 
-    course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
-    if not course:
-        raise HTTPException(status_code=404, detail="Course not found")
+    course = _get_course(course_id, db, current_user)
 
     quiz = db.query(Quiz).filter(Quiz.id == quiz_id, Quiz.course_id == course_id).first()
     if not quiz:
